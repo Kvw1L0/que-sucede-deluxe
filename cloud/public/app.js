@@ -38,18 +38,82 @@ let secret = localStorage.getItem(storageKey) || '',
   lastTickSecond = -1,
   editingRoundId = null,
   lastVideoSeq = -1,
-  localTvVideos = {}; // map of filename or roundId -> Blob URL for large local files on TV
+  localTvVideos = {}; // map of filename -> Blob URL loaded automatically from IndexedDB
 
 const seenReactions = new Set();
+
+/* --- IndexedDB for sharing large local video files from Admin to TV cleanly --- */
+function openVideoDb() {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === 'undefined') return reject(new Error('No IndexedDB'));
+    const req = indexedDB.open('qsd-local-videos-db', 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains('videos')) {
+        db.createObjectStore('videos', { keyPath: 'name' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function saveLocalVideoToIdb(file) {
+  try {
+    const db = await openVideoDb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction('videos', 'readwrite');
+      tx.objectStore('videos').put({ name: file.name, file, updatedAt: Date.now() });
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+    const blobUrl = URL.createObjectURL(file);
+    localTvVideos[file.name] = blobUrl;
+    localTvVideos['local:' + file.name] = blobUrl;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function loadLocalVideosFromIdb() {
+  try {
+    const db = await openVideoDb();
+    const items = await new Promise((resolve, reject) => {
+      const tx = db.transaction('videos', 'readonly');
+      const req = tx.objectStore('videos').getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+    for (const item of items) {
+      if (item?.name && item?.file && !localTvVideos[item.name]) {
+        const blobUrl = URL.createObjectURL(item.file);
+        localTvVideos[item.name] = blobUrl;
+        localTvVideos['local:' + item.name] = blobUrl;
+      }
+    }
+  } catch {}
+}
+
+loadLocalVideosFromIdb().then(() => {
+  if (role === 'screen' && state) {
+    viewKey = '';
+    render();
+  }
+});
 
 /* --- BroadcastChannel for zero-latency same-PC sync between Admin and TV --- */
 const bc = typeof BroadcastChannel !== 'undefined' && code ? new BroadcastChannel('qsd-room-' + code) : null;
 if (bc) {
-  bc.onmessage = e => {
+  bc.onmessage = async e => {
     const msg = e.data;
     if (!msg) return;
     if (msg.type === 'video-cmd' && role === 'screen') {
       applyVideoCommand(msg.videoState, true);
+    } else if (msg.type === 'local-video-updated' && role === 'screen') {
+      await loadLocalVideosFromIdb();
+      viewKey = '';
+      render();
     } else if (msg.type === 'refresh') {
       refresh(true).catch(() => {});
     }
@@ -199,13 +263,13 @@ function toggleFullscreen() {
 }
 
 function header() {
+  if (role === 'screen') return '';
   const entry = app.classList.contains('entry');
   const roleLabel =
     {
       admin: 'Administración Deluxe',
       host: 'Director · privado',
-      player: 'Jugador',
-      screen: 'Pantalla gigante'
+      player: 'Jugador'
     }[role] || '';
   return `<header class="${entry ? 'entry-header' : ''}">
     ${
@@ -221,15 +285,6 @@ function header() {
               <button type="button" id="sound-toggle" class="tool-btn" title="Activar o silenciar efectos de sonido">${
                 soundEnabled ? '🔊 Sonido' : '🔇 Silencio'
               }</button>
-              ${
-                role === 'screen'
-                  ? `<label class="tool-btn local-video-label" title="Cargar videos locales pesados desde este computador sin subirlos a internet">
-                      📂 Videos locales (${Object.keys(localTvVideos).length})
-                      <input type="file" id="tv-local-files" accept="video/*" multiple hidden>
-                    </label>
-                    <button type="button" id="fs-toggle" class="tool-btn" title="Pantalla completa">⛶ Pantalla completa</button>`
-                  : ''
-              }
             </div>
             <span class="tag">${roleLabel}</span>
             <span class="connection"></span>
@@ -241,19 +296,6 @@ function header() {
 function bindHeaderTools() {
   if ($('#sound-toggle')) $('#sound-toggle').onclick = toggleSound;
   if ($('#fs-toggle')) $('#fs-toggle').onclick = toggleFullscreen;
-  if ($('#tv-local-files')) {
-    $('#tv-local-files').onchange = e => {
-      const files = Array.from(e.target.files || []);
-      for (const f of files) {
-        const blobUrl = URL.createObjectURL(f);
-        localTvVideos[f.name] = blobUrl;
-        localTvVideos['local:' + f.name] = blobUrl;
-      }
-      notice(`Se vincularon ${files.length} video(s) locales en esta Pantalla Gigante.`);
-      viewKey = '';
-      render();
-    };
-  }
 }
 
 function status() {
@@ -616,11 +658,22 @@ function resolveVideoSrc(rawUrl) {
   return rawUrl;
 }
 
-function videoStageHtml(s) {
+function videoStageHtml(s, cleanTv = false) {
   if (!s.round?.videoUrl) return '';
   if (!['watching', 'open', 'closed', 'results'].includes(s.phase)) return '';
   const src = resolveVideoSrc(s.round.videoUrl);
   const isMissingLocal = src.startsWith('local:');
+  if (cleanTv) {
+    return `<div class="video-stage tv-clean-stage">
+      ${
+        isMissingLocal
+          ? `<div class="missing-local-video">
+              <p>🎬 Preparando video (<strong>${esc(src.slice(6))}</strong>)…</p>
+            </div>`
+          : `<video id="round-video" src="${esc(src)}" playsinline preload="auto"></video>`
+      }
+    </div>`;
+  }
   const badgeText =
     s.phase === 'watching'
       ? '🎬 Escena en curso · Atención al corte'
@@ -632,8 +685,7 @@ function videoStageHtml(s) {
     ${
       isMissingLocal
         ? `<div class="missing-local-video">
-            <p>📂 Este video es un archivo local pesado (<strong>${esc(src.slice(6))}</strong>).</p>
-            <p>Haz clic en el botón superior <strong>"📂 Videos locales"</strong> en esta pantalla para seleccionarlo desde tu computador.</p>
+            <p>🎬 Video local (<strong>${esc(src.slice(6))}</strong>).</p>
           </div>`
         : `<video id="round-video" src="${esc(src)}" playsinline preload="auto" controls></video>`
     }
@@ -697,8 +749,36 @@ function roundBadgesHtml(s) {
   </div>`;
 }
 
+function screenContent() {
+  const s = state;
+  if (s.phase === 'lobby') {
+    return `<div class="tv-waiting-stage">
+      <div class="tv-waiting-inner">
+        <h1>${esc(s.title)}</h1>
+        <p class="tv-pin">PIN: <strong>${esc(code)}</strong></p>
+      </div>
+    </div>`;
+  }
+  if (['watching', 'open', 'closed'].includes(s.phase)) {
+    return `<div class="tv-cinema-view">
+      ${videoStageHtml(s, true)}
+    </div>`;
+  }
+  if (s.phase === 'results') {
+    return `<div class="tv-cinema-view">
+      ${videoStageHtml(s, true)}
+      <section class="tv-answer-reveal">
+        <span class="tv-answer-label">✓ RESPUESTA CORRECTA</span>
+        <h2><strong>${letters[s.round.correct]}</strong> · ${esc(s.round.options[s.round.correct])}</h2>
+      </section>
+    </div>`;
+  }
+  return ranking();
+}
+
 function publicContent() {
   const s = state;
+  if (role === 'screen') return screenContent();
   if (s.phase === 'lobby') {
     const lobbyPlayers = s.lobbyPlayers || [];
     return `<div class="lobby-hero">
@@ -732,7 +812,6 @@ function publicContent() {
   if (s.phase === 'open') {
     return `${roundBadgesHtml(s)}
       <h1>${esc(s.round.question)}</h1>
-      ${role === 'screen' ? videoStageHtml(s) : ''}
       ${timerBarHtml()}
       ${options()}
       <p class="muted"><strong>${s.received}</strong> de ${s.playerCount} respuestas recibidas</p>`;
@@ -877,8 +956,8 @@ function player() {
 const help = `<details>
   <summary>📖 Cómo cargar tus propios videos y controlarlos en vivo</summary>
   <ol>
-    <li><strong>Opción A — Subir clip directo a la nube (hasta 3 MB):</strong> Al crear o editar una pregunta, elige tu archivo <code>.mp4</code> o <code>.webm</code> y pulsa <em>"☁️ Subir clip al servidor"</em>. Quedará guardado en Upstash Redis y se reproducirá en cualquier TV o navegador automáticamente.</li>
-    <li><strong>Opción B — Archivo grande local en el mismo PC (sin límite de peso):</strong> Si tienes un video pesado (ej. 50 MB), selecciónalo y pulsa <em>"💻 Usar como archivo local"</em>. Luego, en la ventana de <strong>Pantalla Gigante</strong>, haz clic arriba en <em>"📂 Videos locales"</em> y selecciona tus archivos MP4.</li>
+    <li><strong>Opción A — Subir clip directo a la nube (hasta 3 MB):</strong> Al crear o editar una película, elige tu archivo <code>.mp4</code> o <code>.webm</code> y pulsa <em>"☁️ Subir clip al servidor"</em>. Quedará guardado en Upstash Redis y se reproducirá en cualquier TV o navegador automáticamente.</li>
+    <li><strong>Opción B — Archivo grande local desde el Admin (sin límite de peso):</strong> Si tienes un video pesado (ej. 50 MB o 200 MB), selecciónalo aquí mismo en el Admin y pulsa <em>"💻 Guardar y usar video local"</em>. El navegador lo guardará automáticamente y la <strong>Pantalla Gigante</strong> lo reproducirá sola sin mostrar ningún botón de configuración.</li>
     <li><strong>Marcar tiempos con vista previa:</strong> Usa el reproductor de vista previa en el editor y pulsa <em>"✂️ Capturar segundo actual como Corte"</em> en el instante exacto del suspenso.</li>
     <li><strong>Control Remoto en Vivo:</strong> Durante la ronda verás la botonera <strong>🎮 Control Remoto del Video</strong> para <strong>Pausar</strong>, <strong>Continuar (Play)</strong>, <strong>Reiniciar escena (0s)</strong>, <strong>Ir al corte</strong> o <strong>Reproducir desenlace</strong> cuando tú quieras.</li>
   </ol>
@@ -1102,9 +1181,9 @@ function host() {
           <div class="row">
             <input type="file" id="video-file-input" accept="video/mp4,video/webm,video/quicktime" style="margin:0;flex:1">
             <button type="button" id="btn-upload-cloud" class="primary-soft">☁️ Subir clip al servidor (máx 3 MB)</button>
-            <button type="button" id="btn-use-local" class="quiet">💻 Usar archivo pesado en modo local</button>
+            <button type="button" id="btn-use-local" class="quiet">💻 Guardar y usar video local (sin límite)</button>
           </div>
-          <small class="muted" id="upload-status">Puedes subir un clip corto a la nube, elegir un archivo local o pegar un enlace directo (.mp4).</small>
+          <small class="muted" id="upload-status">Puedes subir un clip a la nube, guardar un video pesado local desde aquí mismo (se verá en la TV automáticamente) o pegar un enlace directo (.mp4).</small>
 
           <label style="margin-top:12px">URL o ruta del video
             <input name="videoUrl" id="input-video-url" maxlength="500" value="${esc(
@@ -1114,7 +1193,7 @@ function host() {
 
           <div class="preview-stage">
             <video id="editor-preview-video" src="${esc(
-              editingRound?.videoUrl && !editingRound.videoUrl.startsWith('local:') ? editingRound.videoUrl : '/demo.mp4'
+              editingRound?.videoUrl ? resolveVideoSrc(editingRound.videoUrl) : '/demo.mp4'
             )}" controls preload="metadata"></video>
             <div class="row" style="margin-top:10px">
               <button type="button" id="btn-set-cut">✂️ Capturar segundo actual como Corte</button>
@@ -1143,7 +1222,13 @@ function host() {
       </form>
     </details>
 
-    <h2>Lista de películas / preguntas (${s.roundCount})</h2>
+    <div class="row" style="justify-content:space-between;align-items:center;margin-top:26px">
+      <h2 style="margin:0">Lista de películas / preguntas (${s.roundCount})</h2>
+      <label class="tool-btn local-video-label" title="Pre-cargar varios archivos de video locales desde el Admin para la TV">
+        📂 Cargar carpeta/archivos de video locales en Admin
+        <input type="file" id="admin-batch-local-files" accept="video/*" multiple hidden>
+      </label>
+    </div>
     <div class="rounds-list">
       ${s.rounds
         .map(
@@ -1298,19 +1383,32 @@ function host() {
   const statusEl = $('#upload-status');
 
   if (fileInput && previewVideo) {
-    fileInput.onchange = () => {
+    fileInput.onchange = async () => {
       const f = fileInput.files?.[0];
       if (!f) return;
-      const blobUrl = URL.createObjectURL(f);
+      await saveLocalVideoToIdb(f);
+      bc?.postMessage({ type: 'local-video-updated' });
+      const blobUrl = localTvVideos[f.name] || URL.createObjectURL(f);
       previewVideo.src = blobUrl;
+      urlInput.value = 'local:' + f.name;
       const sizeMb = (f.size / (1024 * 1024)).toFixed(2);
-      statusEl.textContent = `Archivo seleccionado: ${f.name} (${sizeMb} MB). Usa la vista previa abajo para marcar el corte o súbelo al servidor.`;
+      statusEl.textContent = `✅ Video cargado en el Admin (${f.name} · ${sizeMb} MB) y listo para la Pantalla Gigante. Si deseas subirlo también a la nube (máx 3 MB), pulsa "☁️ Subir clip al servidor".`;
+    };
+  }
+  if ($('#admin-batch-local-files')) {
+    $('#admin-batch-local-files').onchange = async e => {
+      const files = Array.from(e.target.files || []);
+      for (const f of files) {
+        await saveLocalVideoToIdb(f);
+      }
+      bc?.postMessage({ type: 'local-video-updated' });
+      notice(`✅ Se guardaron ${files.length} video(s) locales desde el Admin listos para reproducirse en la TV.`);
     };
   }
   if (urlInput && previewVideo) {
     urlInput.oninput = () => {
       const v = urlInput.value.trim();
-      if (v && !v.startsWith('local:')) previewVideo.src = v;
+      if (v) previewVideo.src = resolveVideoSrc(v);
     };
   }
   if ($('#btn-upload-cloud')) {
@@ -1318,7 +1416,7 @@ function host() {
       const f = fileInput?.files?.[0];
       if (!f) return notice('Primero selecciona un archivo de video (.mp4 / .webm).');
       if (f.size > 3 * 1024 * 1024) {
-        return notice('El archivo supera los 3 MB para subida en la nube. Usa el botón "💻 Usar archivo pesado en modo local" o un clip más corto.');
+        return notice('El archivo supera los 3 MB para la nube, pero ya quedó guardado en modo local desde el Admin.');
       }
       const btn = $('#btn-upload-cloud');
       btn.disabled = true;
@@ -1336,8 +1434,8 @@ function host() {
         const uploaded = await request({ op: 'upload-video', name: f.name, mime: f.type || 'video/mp4', data: base64 });
         urlInput.value = uploaded.videoUrl;
         previewVideo.src = uploaded.videoUrl;
-        statusEl.textContent = `✅ ¡Video subido con éxito! (${uploaded.videoUrl})`;
-        notice('Video subido y vinculado a la pregunta.');
+        statusEl.textContent = `✅ ¡Video subido a la nube con éxito! (${uploaded.videoUrl})`;
+        notice('Video subido a la nube y vinculado a la película.');
       } catch (err) {
         statusEl.textContent = '❌ Error al subir: ' + err.message;
         notice(err.message);
@@ -1347,12 +1445,14 @@ function host() {
     };
   }
   if ($('#btn-use-local')) {
-    $('#btn-use-local').onclick = () => {
+    $('#btn-use-local').onclick = async () => {
       const f = fileInput?.files?.[0];
       if (!f) return notice('Primero selecciona un archivo de video desde tu computador.');
+      await saveLocalVideoToIdb(f);
+      bc?.postMessage({ type: 'local-video-updated' });
       urlInput.value = 'local:' + f.name;
-      statusEl.textContent = `💻 Configurado como archivo local (${f.name}). Recuerda seleccionarlo también en el botón "📂 Videos locales" de la Pantalla Gigante.`;
-      notice('Vinculado como archivo local: ' + f.name);
+      statusEl.textContent = `✅ Guardado en Admin (${f.name}). La Pantalla Gigante lo reproducirá automáticamente sin pedir archivos.`;
+      notice('Video local guardado en Admin y sincronizado con la TV: ' + f.name);
     };
   }
   if ($('#btn-set-cut') && previewVideo) {
