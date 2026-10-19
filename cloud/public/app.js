@@ -906,6 +906,36 @@ function remoteVideoControlsHtml(s) {
   </div>`;
 }
 
+function hostOptionsHtml(s) {
+  const showStats = s.stats && s.round;
+  return `<div class="options host-options-grid">
+    ${(s.round?.options || [])
+      .map((o, i) => {
+        const pct = showStats ? s.stats.percents[i] || 0 : 0;
+        const count = showStats ? s.stats.counts[i] || 0 : 0;
+        const isCorrect = s.round.correct === i;
+        return `<div class="option card choice-${i} ${isCorrect ? 'correct' : ''}">
+          <b>${letters[i]}</b>
+          <div class="option-body">
+            <div class="option-text-row">
+              <span>${esc(o)} ${isCorrect ? '<strong class="correct-tag">✓ CORRECTA</strong>' : ''}</span>
+              <div class="host-opt-actions">
+                ${showStats ? `<small class="vote-stat">${pct}% (${count})</small>` : ''}
+                <button type="button" class="mark-correct-btn ${isCorrect ? 'active' : ''}" data-mark-correct="${i}" data-reveal="${
+          s.phase === 'closed' || s.phase === 'results' ? '1' : '0'
+        }">
+                  ${isCorrect ? '✓ Es la correcta' : 'Marcar ' + letters[i] + ' como correcta'}
+                </button>
+              </div>
+            </div>
+            ${showStats ? `<div class="vote-bar-track"><div class="vote-bar-fill" style="width:${pct}%"></div></div>` : ''}
+          </div>
+        </div>`;
+      })
+      .join('')}
+  </div>`;
+}
+
 function host() {
   app.className = 'admin host';
   const s = state;
@@ -915,13 +945,14 @@ function host() {
       '<h1>Acceso del organizador</h1><p>Entra para administrar esta sala.</p><a class="button-link" href="/admin.html">Entrar como organizador →</a>';
     return;
   }
+  const hasNextMovie = s.index + 1 < s.roundCount;
   const action = {
-    lobby: ['prepare', '🎬 Preparar primera ronda'],
-    watching: ['open', '🔓 Abrir respuestas (y pausar en el corte)'],
-    open: ['close', '🔒 Cerrar respuestas (y reproducir desenlace)'],
-    closed: ['results', '✨ Mostrar resultados y estadísticas'],
-    results: ['ranking', '🏆 Mostrar ranking y podio'],
-    ranking: s.index + 1 < s.roundCount ? ['prepare', '🎬 Preparar siguiente ronda'] : ['finish', '🎉 Finalizar partida']
+    lobby: ['prepare', '🎬 Iniciar primera película / ronda'],
+    watching: ['open', '🔓 Abrir alternativas para votar'],
+    open: ['close', '🔒 Cerrar votación (y mostrar desenlace)'],
+    closed: ['results', '✅ Indicar / Revelar respuesta correcta'],
+    results: hasNextMovie ? ['prepare', '⏭️ Pasar a la siguiente película'] : ['ranking', '🏆 Mostrar gran podio final'],
+    ranking: hasNextMovie ? ['prepare', '⏭️ Pasar a la siguiente película'] : ['finish', '🎉 Finalizar partida']
   }[s.phase];
 
   const editingRound = editingRoundId ? s.rounds.find(r => r.id === editingRoundId) : null;
@@ -951,32 +982,62 @@ function host() {
       <button type="button" id="copy">📋 Copiar enlace de invitación</button>
     </nav>
     <section class="director-panel">
-      <div class="row">
-        <strong>🎛️ Control en vivo</strong>
-        <span class="pill">${s.playerCount} jugadores</span>
-        <span class="pill">${s.index < 0 ? 'En espera (Lobby)' : 'Ronda ' + (s.index + 1) + ' de ' + s.roundCount}</span>
+      <div class="row" style="justify-content:space-between">
+        <div class="row">
+          <strong>🎛️ Control del Director en Vivo</strong>
+          <span class="pill">${s.playerCount} jugadores</span>
+          <span class="pill">${s.index < 0 ? 'En espera (Lobby)' : 'Película / Ronda ' + (s.index + 1) + ' de ' + s.roundCount}</span>
+        </div>
+        ${
+          s.round
+            ? `<span class="pill pill-gold">Correcta actual: Alternativa ${letters[s.round.correct]}</span>`
+            : ''
+        }
       </div>
       ${
         s.round
           ? `<h2>${esc(s.round.question)}</h2>
             ${remoteVideoControlsHtml(s)}
-            ${options()}
+            <p class="muted" style="margin:6px 0 10px">💡 Puedes hacer clic en cualquier alternativa abajo para definirla como la <strong>Respuesta Correcta</strong> en vivo:</p>
+            ${hostOptionsHtml(s)}
             <p class="muted">
               ${s.round.practice ? 'Ensayo sin puntos' : '1.000 puntos base por acierto'}
               ${!s.round.practice && s.settings?.speedBonus ? ' · ⚡ Bono rapidez activo' : ''}
               ${!s.round.practice && s.settings?.streakBonus ? ' · 🔥 Bono racha activo' : ''}
               ${s.round.videoUrl ? ` · 🎬 Video: ${esc(s.round.videoUrl)} (corte: ${s.round.cutTime ?? '-'}s)` : ''}
             </p>`
-          : '<p class="muted">Prepara las rondas abajo y pulsa "Preparar primera ronda" para comenzar.</p>'
+          : '<p class="muted">Prepara las películas/rondas abajo y pulsa "Iniciar primera película" para comenzar.</p>'
       }
-      ${s.phase === 'watching' ? '<p class="director-hint">🎬 El video se está mostrando en la Pantalla Gigante. Puedes pausarlo/continuarlo arriba o abrir las respuestas.</p>' : ''}
-      ${s.phase === 'closed' ? '<p class="director-hint">🍿 Mostrando el desenlace del video antes de revelar la respuesta correcta.</p>' : ''}
+      ${s.phase === 'watching' ? '<p class="director-hint">🎬 El video se está mostrando en la Pantalla Gigante. Pausa en el corte y abre las alternativas.</p>' : ''}
+      ${s.phase === 'closed' ? '<p class="director-hint">🍿 Votación cerrada. Reproduce el desenlace del video y luego pulsa "✅ Indicar / Revelar respuesta correcta".</p>' : ''}
       ${s.phase === 'open' ? `${timerBarHtml()}<p><strong>${s.received}</strong> de ${s.playerCount} respuestas recibidas</p>` : ''}
-      ${
-        action
-          ? `<button id="action" class="primary" data-live ${!s.roundCount ? 'disabled' : ''}>${action[1]}</button>`
-          : ''
-      }
+
+      <div class="director-actions-bar">
+        ${
+          action
+            ? `<button id="action" class="primary" data-live ${!s.roundCount ? 'disabled' : ''}>${action[1]}</button>`
+            : ''
+        }
+        ${
+          s.round && s.phase !== 'results'
+            ? `<button type="button" id="btn-reveal-now" class="director-secondary-btn" data-live>✅ Indicar respuesta correcta ahora (${
+                letters[s.round.correct]
+              })</button>`
+            : ''
+        }
+        ${
+          s.round && s.phase === 'results'
+            ? `<button type="button" id="btn-show-ranking" class="director-secondary-btn" data-live>🏆 Ver tabla de posiciones / Podio</button>`
+            : ''
+        }
+        ${
+          hasNextMovie && s.index >= 0 && s.phase !== 'results' && s.phase !== 'ranking'
+            ? `<button type="button" id="btn-next-movie" class="director-secondary-btn" data-live>⏭️ Pasar a la siguiente película (${
+                s.index + 2
+              }/${s.roundCount})</button>`
+            : ''
+        }
+      </div>
     </section>
 
     ${
@@ -1000,7 +1061,7 @@ function host() {
 
     <details id="editor" ${editingRound ? 'open' : ''}>
       <summary>${
-        editingRound ? '✏️ Editando pregunta y video' : '➕ Añadir pregunta o cargar nuevo video'
+        editingRound ? '✏️ Editando película / pregunta' : '➕ Añadir nueva película o pregunta'
       }</summary>
       <form id="round">
         <label>Pregunta
@@ -1029,15 +1090,15 @@ function host() {
         <label>Segundos para responder (10–120)
           <input type="number" min="10" max="120" value="${editingRound?.seconds || 25}" name="seconds" required>
         </label>
-        <label>Categoría o etiqueta (opcional)
-          <input name="category" maxlength="40" value="${esc(editingRound?.category || '')}" placeholder="Ej: Clásicos, Acción, Humor">
+        <label>Nombre de la película o categoría (opcional)
+          <input name="category" maxlength="40" value="${esc(editingRound?.category || '')}" placeholder="Ej: Película 1, Acción, Clásicos">
         </label>
         <label style="align-self:end"><input type="checkbox" name="practice" ${
           editingRound?.practice ? 'checked' : ''
         }> Ronda de ensayo (sin puntos)</label>
 
         <div class="video-uploader-box" style="grid-column:1/-1">
-          <h3>🎬 Cargar o vincular video para esta pregunta</h3>
+          <h3>🎬 Cargar o vincular video para esta película</h3>
           <div class="row">
             <input type="file" id="video-file-input" accept="video/mp4,video/webm,video/quicktime" style="margin:0;flex:1">
             <button type="button" id="btn-upload-cloud" class="primary-soft">☁️ Subir clip al servidor (máx 3 MB)</button>
@@ -1076,22 +1137,22 @@ function host() {
         </div>
 
         <div class="row" style="grid-column:1/-1;margin-top:12px">
-          <button class="primary">${editingRound ? 'Guardar cambios' : 'Guardar pregunta'}</button>
+          <button class="primary">${editingRound ? 'Guardar cambios' : 'Guardar película / pregunta'}</button>
           ${editingRound ? '<button type="button" id="cancel-edit" class="quiet">Cancelar edición</button>' : ''}
         </div>
       </form>
     </details>
 
-    <h2>Preguntas de la sala (${s.roundCount})</h2>
+    <h2>Lista de películas / preguntas (${s.roundCount})</h2>
     <div class="rounds-list">
       ${s.rounds
         .map(
           (q, i) =>
-            `<div class="rank round-item">
+            `<div class="rank round-item ${s.index === i ? 'active-round-row' : ''}">
               <div>
-                <strong>${i + 1}. ${esc(q.question)}</strong>
+                <strong>${i + 1}. ${esc(q.question)} ${s.index === i ? '<span class="pill pill-live">EN PANTALLA</span>' : ''}</strong>
                 <div class="muted small-meta">
-                  ✓ ${letters[q.correct]}: ${esc(q.options[q.correct])} · ⏱️ ${q.seconds}s
+                  ✓ Correcta: <strong>${letters[q.correct]} (${esc(q.options[q.correct])})</strong> · ⏱️ ${q.seconds}s
                   ${q.practice ? ' · 🧪 Ensayo' : ''}
                   ${q.category ? ` · 🏷️ ${esc(q.category)}` : ''}
                   ${
@@ -1102,6 +1163,13 @@ function host() {
                 </div>
               </div>
               <div class="round-actions">
+                ${
+                  s.index !== i
+                    ? `<button type="button" class="primary-soft" data-jump="${i}" title="Ir directamente a esta película">▶ Lanzar película ${
+                        i + 1
+                      }</button>`
+                    : ''
+                }
                 ${
                   s.phase === 'lobby'
                     ? `<button type="button" data-move="up" data-id="${q.id}" ${i === 0 ? 'disabled' : ''} title="Subir">↑</button>
@@ -1153,9 +1221,52 @@ function host() {
   if ($('#action'))
     $('#action').onclick = async () => {
       sfx.click();
-      await mutate({ op: 'action', action: action[0], expectedPhase: s.phase, expectedIndex: s.index });
+      await mutate({ op: 'action', action: action[0], expectedPhase: s.phase, expectedIndex: s.index, force: true });
       bc?.postMessage({ type: 'refresh' });
     };
+  if ($('#btn-reveal-now'))
+    $('#btn-reveal-now').onclick = async () => {
+      sfx.click();
+      await mutate({ op: 'action', action: 'results', expectedPhase: s.phase, expectedIndex: s.index, force: true });
+      bc?.postMessage({ type: 'refresh' });
+    };
+  if ($('#btn-show-ranking'))
+    $('#btn-show-ranking').onclick = async () => {
+      sfx.click();
+      await mutate({ op: 'action', action: 'ranking', expectedPhase: s.phase, expectedIndex: s.index, force: true });
+      bc?.postMessage({ type: 'refresh' });
+    };
+  if ($('#btn-next-movie'))
+    $('#btn-next-movie').onclick = async () => {
+      sfx.click();
+      await mutate({
+        op: 'action',
+        action: 'prepare',
+        targetIndex: s.index + 1,
+        expectedPhase: s.phase,
+        expectedIndex: s.index,
+        force: true
+      });
+      bc?.postMessage({ type: 'refresh' });
+    };
+  document.querySelectorAll('[data-jump]').forEach(btn => {
+    btn.onclick = async () => {
+      sfx.click();
+      const targetIndex = Number(btn.dataset.jump);
+      await mutate({ op: 'action', action: 'prepare', targetIndex, expectedPhase: s.phase, expectedIndex: s.index, force: true });
+      bc?.postMessage({ type: 'refresh' });
+    };
+  });
+  document.querySelectorAll('[data-mark-correct]').forEach(btn => {
+    btn.onclick = async () => {
+      sfx.click();
+      const correctChoice = Number(btn.dataset.markCorrect);
+      const reveal = btn.dataset.reveal === '1';
+      await mutate({ op: 'set-correct', roundIndex: s.index, correct: correctChoice, reveal });
+      notice(`Alternativa ${letters[correctChoice]} marcada como la respuesta correcta.`);
+      bc?.postMessage({ type: 'refresh' });
+    };
+  });
   if ($('#reset-game'))
     $('#reset-game').onclick = () => {
       if (confirm('¿Reiniciar la partida al lobby y poner los puntajes en cero?')) {

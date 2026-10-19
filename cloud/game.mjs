@@ -161,13 +161,67 @@ export function phase(r, now) {
   return r.phase === 'open' && now >= r.deadline ? 'closed' : r.phase;
 }
 
-export function advance(r, action, now) {
+export function recalculateScores(r) {
+  for (const p of r.players) {
+    p.score = 0;
+    p.streak = 0;
+  }
+  const settings = r.settings || { speedBonus: false, streakBonus: false };
+  for (let idx = 0; idx < r.rounds.length; idx++) {
+    const q = r.rounds[idx];
+    for (const p of r.players) {
+      const key = q.id + ':' + p.id;
+      const ans = r.answers[key];
+      if (!ans) continue;
+      const correct = ans.choice === q.correct;
+      let base = 0;
+      let speedBonus = 0;
+      let streakBonus = 0;
+      if (!q.practice) {
+        if (correct) {
+          base = 1000;
+          p.streak = (p.streak || 0) + 1;
+          if (settings.speedBonus) speedBonus = ans.rawSpeedBonus ?? ans.speedBonus ?? 0;
+          if (settings.streakBonus && p.streak >= 2) {
+            streakBonus = Math.min(300, (p.streak - 1) * 100);
+          }
+        } else {
+          p.streak = 0;
+        }
+      }
+      const points = base + speedBonus + streakBonus;
+      ans.correct = correct;
+      ans.base = base;
+      ans.speedBonus = speedBonus;
+      ans.streakBonus = streakBonus;
+      ans.points = points;
+      ans.streak = p.streak || 0;
+      p.score += points;
+    }
+  }
+}
+
+export function setCorrect(r, roundIndex, correctChoice, revealNow, now) {
+  const idx = Number.isInteger(roundIndex) ? roundIndex : r.index;
+  const q = r.rounds[idx];
+  check(q, 'Primero prepara una ronda.');
+  check(Number.isInteger(correctChoice) && correctChoice >= 0 && correctChoice < 4, 'Alternativa inválida.', 400);
+  q.correct = correctChoice;
+  recalculateScores(r);
+  if (revealNow && idx === r.index) {
+    r.phase = 'results';
+    r.resultsAt = now;
+  }
+}
+
+export function advance(r, action, now, targetIndex = null) {
   r.phase = phase(r, now);
   const is = (...states) => check(states.includes(r.phase), 'La partida cambió. Actualiza antes de continuar.');
   if (action === 'prepare') {
-    is('lobby', 'ranking');
-    check(r.index + 1 < r.rounds.length, 'No hay más preguntas.');
-    r.index++;
+    is('lobby', 'watching', 'open', 'closed', 'results', 'ranking', 'finished');
+    const nextIdx = Number.isInteger(targetIndex) ? targetIndex : r.index + 1;
+    check(nextIdx >= 0 && nextIdx < r.rounds.length, 'No hay más películas o preguntas en la lista.');
+    r.index = nextIdx;
     r.phase = 'watching';
     r.phaseStartedAt = now;
     const q = r.rounds[r.index];
@@ -179,7 +233,7 @@ export function advance(r, action, now) {
       updatedAt: now
     };
   } else if (action === 'open') {
-    is('watching');
+    is('watching', 'closed', 'results');
     r.phase = 'open';
     r.openedAt = now;
     r.deadline = now + r.rounds[r.index].seconds * 1000;
@@ -192,7 +246,7 @@ export function advance(r, action, now) {
       updatedAt: now
     };
   } else if (action === 'close') {
-    is('open');
+    is('open', 'watching');
     r.phase = 'closed';
     r.closedAt = now;
     const q = r.rounds[r.index];
@@ -204,14 +258,14 @@ export function advance(r, action, now) {
       updatedAt: now
     };
   } else if (action === 'results') {
-    is('closed');
+    is('open', 'closed', 'watching', 'ranking');
     r.phase = 'results';
     r.resultsAt = now;
   } else if (action === 'ranking') {
-    is('results');
+    is('results', 'closed', 'watching');
     r.phase = 'ranking';
   } else if (action === 'finish') {
-    is('ranking');
+    is('results', 'ranking', 'closed');
     r.phase = 'finished';
   } else {
     check(false, 'Acción desconocida.', 400);
@@ -271,13 +325,17 @@ export function answer(r, p, b, now) {
   let speedBonus = 0;
   let streakBonus = 0;
 
+  const rawSpeedBonus =
+    r.deadline && q.seconds > 0
+      ? Math.min(300, Math.max(0, Math.round((300 * Math.max(0, r.deadline - now)) / (q.seconds * 1000))))
+      : 0;
+
   if (!q.practice) {
     if (correct) {
       base = 1000;
       p.streak = (p.streak || 0) + 1;
-      if (settings.speedBonus && r.deadline && q.seconds > 0) {
-        const remaining = Math.max(0, r.deadline - now);
-        speedBonus = Math.min(300, Math.max(0, Math.round((300 * remaining) / (q.seconds * 1000))));
+      if (settings.speedBonus) {
+        speedBonus = rawSpeedBonus;
       }
       if (settings.streakBonus && p.streak >= 2) {
         streakBonus = Math.min(300, (p.streak - 1) * 100);
@@ -294,6 +352,7 @@ export function answer(r, p, b, now) {
     points,
     base,
     speedBonus,
+    rawSpeedBonus,
     streakBonus,
     streak: p.streak || 0,
     answeredAt: now

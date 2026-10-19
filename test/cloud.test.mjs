@@ -199,5 +199,13 @@ test('carga de video y control remoto (Play, Pausa, Corte, Desenlace) desde el a
   assert.equal(revRes.videoState.status, 'playing');
   assert.equal(revRes.videoState.position, 3.5);
   assert.equal(revRes.videoState.stopAt, 8.0);
+
+  // Add a second movie and test live set-correct + direct jump to next movie
+  await call({ op: 'round', code, ...definition, question: 'Segunda película' }, hostToken);
+  const markRes = await call({ op: 'set-correct', code, roundIndex: 0, correct: 2, reveal: true }, hostToken);
+  assert.equal(markRes.status, 200);
+
+  const jumpRes = await call({ op: 'action', code, action: 'prepare', targetIndex: 1, force: true }, hostToken);
+  assert.equal(jumpRes.status, 200);
 });
 

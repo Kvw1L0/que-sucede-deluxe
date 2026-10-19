@@ -1,4 +1,4 @@
-import { token, hash, check, round, advance, controlVideo, answer, snapshot, QUESTION_TEMPLATES } from '../cloud/game.mjs';
+import { token, hash, check, round, advance, setCorrect, recalculateScores, controlVideo, answer, snapshot, QUESTION_TEMPLATES } from '../cloud/game.mjs';
 import { RedisStore, update } from '../cloud/store.mjs';
 import QRCode from 'qrcode';
 import { adminSession, setAdminCookie } from '../cloud/admin.mjs';
@@ -135,6 +135,7 @@ export function handler(db = store, env = process.env) {
               'kick',
               'delete',
               'action',
+              'set-correct',
               'video-control',
               'upload-video'
             ].includes(op))
@@ -229,14 +230,17 @@ export function handler(db = store, env = process.env) {
         if (op === 'video-control') {
           controlVideo(r, b, Date.now());
           return { ok: true, videoState: r.videoState };
+        } else if (op === 'set-correct') {
+          setCorrect(r, Number.isInteger(b.roundIndex) ? b.roundIndex : r.index, Number(b.correct), b.reveal === true, Date.now());
+          return { ok: true };
         } else if (op === 'round') {
-          check(r.phase === 'lobby', 'Las preguntas se preparan antes de empezar.');
           check(r.rounds.length < 30, 'Máximo 30 rondas.');
           r.rounds.push(round(b));
         } else if (op === 'edit-round') {
           const idx = r.rounds.findIndex(q => q.id === b.id);
           check(idx >= 0, 'Pregunta no encontrada.', 404);
           r.rounds[idx] = round({ ...b, id: b.id });
+          recalculateScores(r);
         } else if (op === 'move-round') {
           check(r.phase === 'lobby', 'Las preguntas se ordenan antes de empezar.');
           const idx = r.rounds.findIndex(q => q.id === b.id);
@@ -265,6 +269,7 @@ export function handler(db = store, env = process.env) {
             speedBonus: b.speedBonus === true,
             streakBonus: b.streakBonus === true
           };
+          recalculateScores(r);
         } else if (op === 'delete') {
           check(r.phase === 'lobby', 'La partida ya comenzó.');
           r.rounds = r.rounds.filter(q => q.id !== b.id);
@@ -284,11 +289,12 @@ export function handler(db = store, env = process.env) {
           }
         } else if (op === 'action') {
           check(
-            (r.phase === b.expectedPhase && r.index === b.expectedIndex) ||
+            b.force === true ||
+              (r.phase === b.expectedPhase && r.index === b.expectedIndex) ||
               (r.phase === 'open' && Date.now() >= r.deadline && b.expectedPhase === 'closed' && r.index === b.expectedIndex),
             'La partida cambió. Revisa su estado.'
           );
-          advance(r, b.action, Date.now());
+          advance(r, b.action, Date.now(), Number.isInteger(b.targetIndex) ? b.targetIndex : null);
         } else {
           check(false, 'Operación desconocida.', 400);
         }
