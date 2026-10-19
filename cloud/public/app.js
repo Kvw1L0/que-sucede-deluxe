@@ -36,9 +36,25 @@ let secret = localStorage.getItem(storageKey) || '',
   qr = '',
   soundEnabled = localStorage.getItem('qsd-sound') !== 'off',
   lastTickSecond = -1,
-  editingRoundId = null;
+  editingRoundId = null,
+  lastVideoSeq = -1,
+  localTvVideos = {}; // map of filename or roundId -> Blob URL for large local files on TV
 
 const seenReactions = new Set();
+
+/* --- BroadcastChannel for zero-latency same-PC sync between Admin and TV --- */
+const bc = typeof BroadcastChannel !== 'undefined' && code ? new BroadcastChannel('qsd-room-' + code) : null;
+if (bc) {
+  bc.onmessage = e => {
+    const msg = e.data;
+    if (!msg) return;
+    if (msg.type === 'video-cmd' && role === 'screen') {
+      applyVideoCommand(msg.videoState, true);
+    } else if (msg.type === 'refresh') {
+      refresh(true).catch(() => {});
+    }
+  };
+}
 
 /* --- Web Audio API Sound Engine --- */
 class SoundFX {
@@ -207,7 +223,11 @@ function header() {
               }</button>
               ${
                 role === 'screen'
-                  ? '<button type="button" id="fs-toggle" class="tool-btn" title="Pantalla completa">⛶ Pantalla completa</button>'
+                  ? `<label class="tool-btn local-video-label" title="Cargar videos locales pesados desde este computador sin subirlos a internet">
+                      📂 Videos locales (${Object.keys(localTvVideos).length})
+                      <input type="file" id="tv-local-files" accept="video/*" multiple hidden>
+                    </label>
+                    <button type="button" id="fs-toggle" class="tool-btn" title="Pantalla completa">⛶ Pantalla completa</button>`
                   : ''
               }
             </div>
@@ -221,6 +241,19 @@ function header() {
 function bindHeaderTools() {
   if ($('#sound-toggle')) $('#sound-toggle').onclick = toggleSound;
   if ($('#fs-toggle')) $('#fs-toggle').onclick = toggleFullscreen;
+  if ($('#tv-local-files')) {
+    $('#tv-local-files').onchange = e => {
+      const files = Array.from(e.target.files || []);
+      for (const f of files) {
+        const blobUrl = URL.createObjectURL(f);
+        localTvVideos[f.name] = blobUrl;
+        localTvVideos['local:' + f.name] = blobUrl;
+      }
+      notice(`Se vincularon ${files.length} video(s) locales en esta Pantalla Gigante.`);
+      viewKey = '';
+      render();
+    };
+  }
 }
 
 function status() {
@@ -256,7 +289,7 @@ function home() {
       <a class="role-card" href="/admin.html">
         <span class="role-icon" aria-hidden="true">☷</span>
         <h2>Administrador</h2>
-        <p>Crea salas, usa plantillas de preguntas, configura bonos y dirige el show.</p>
+        <p>Sube tus videos, marca el corte exacto y pausa o continúa en vivo.</p>
         <span class="role-arrow" aria-hidden="true">→</span>
       </a>
     </div>`;
@@ -391,7 +424,7 @@ async function admin() {
                   <option value="demo">🎬 Pack Demo con Video Integrado (2 rondas)</option>
                   <option value="cine">🍿 Pack Momentos Inesperados del Cine (4 rondas)</option>
                   <option value="bloopers">😂 Pack Bloopers y Videos Virales (3 rondas)</option>
-                  <option value="">✨ Sala en blanco (añadir preguntas manualmente)</option>
+                  <option value="">✨ Sala en blanco (subir mis propios videos y preguntas)</option>
                 </select>
               </label>
               <div class="checkbox-row">
@@ -575,45 +608,75 @@ const options = () => {
   </div>`;
 };
 
+function resolveVideoSrc(rawUrl) {
+  if (!rawUrl) return '';
+  if (localTvVideos[rawUrl]) return localTvVideos[rawUrl];
+  const baseName = rawUrl.replace(/^local:/, '');
+  if (localTvVideos[baseName]) return localTvVideos[baseName];
+  return rawUrl;
+}
+
 function videoStageHtml(s) {
   if (!s.round?.videoUrl) return '';
-  const isIntro = s.phase === 'watching';
-  const isReveal = s.phase === 'closed' || s.phase === 'results';
-  if (!isIntro && !isReveal) return '';
+  if (!['watching', 'open', 'closed', 'results'].includes(s.phase)) return '';
+  const src = resolveVideoSrc(s.round.videoUrl);
+  const isMissingLocal = src.startsWith('local:');
+  const badgeText =
+    s.phase === 'watching'
+      ? '🎬 Escena en curso · Atención al corte'
+      : s.phase === 'open'
+      ? '⏸️ Escena en pausa · ¡Respondan ahora!'
+      : '🍿 Desenlace de la escena';
   return `<div class="video-stage card">
-    <div class="video-badge">${isIntro ? '🎬 Escena en curso · Atención al corte' : '🍿 Desenlace de la escena'}</div>
-    <video id="round-video" src="${esc(s.round.videoUrl)}" playsinline preload="auto" controls></video>
+    <div class="video-badge">${badgeText}</div>
+    ${
+      isMissingLocal
+        ? `<div class="missing-local-video">
+            <p>📂 Este video es un archivo local pesado (<strong>${esc(src.slice(6))}</strong>).</p>
+            <p>Haz clic en el botón superior <strong>"📂 Videos locales"</strong> en esta pantalla para seleccionarlo desde tu computador.</p>
+          </div>`
+        : `<video id="round-video" src="${esc(src)}" playsinline preload="auto" controls></video>`
+    }
   </div>`;
+}
+
+function applyVideoCommand(vs, force = false) {
+  const video = $('#round-video');
+  if (!video || !vs) return;
+  if (!force && vs.seq === lastVideoSeq) return;
+  lastVideoSeq = vs.seq;
+
+  const stopAt = Number.isFinite(Number(vs.stopAt)) ? Number(vs.stopAt) : null;
+  video.ontimeupdate = () => {
+    if (stopAt !== null && video.currentTime >= stopAt) {
+      video.pause();
+      video.ontimeupdate = null;
+    }
+  };
+
+  if (Number.isFinite(Number(vs.position))) {
+    const targetPos = Number(vs.position);
+    if (Math.abs(video.currentTime - targetPos) > 0.6 || force) {
+      try {
+        video.currentTime = targetPos;
+      } catch {}
+    }
+  }
+
+  if (vs.status === 'playing') {
+    if (stopAt === null || video.currentTime < stopAt - 0.1) {
+      video.play().catch(() => {});
+    }
+  } else {
+    video.pause();
+  }
 }
 
 function syncRoundVideo() {
   const video = $('#round-video');
   if (!video || !state?.round?.videoUrl) return;
-  const q = state.round;
-  const cut = Number.isFinite(q.cutTime) ? q.cutTime : null;
-  const end = Number.isFinite(q.endTime) ? q.endTime : null;
-  const modeKey = `${q.id}-${state.phase}`;
-  if (video.dataset.modeKey === modeKey) return;
-  video.dataset.modeKey = modeKey;
-
-  if (state.phase === 'watching') {
-    video.currentTime = 0;
-    video.ontimeupdate = () => {
-      if (cut && video.currentTime >= cut) {
-        video.pause();
-        video.ontimeupdate = null;
-      }
-    };
-    video.play().catch(() => {});
-  } else if (state.phase === 'closed' || state.phase === 'results') {
-    if (cut) video.currentTime = Math.max(0, cut - 0.15);
-    video.ontimeupdate = () => {
-      if (end && video.currentTime >= end) {
-        video.pause();
-        video.ontimeupdate = null;
-      }
-    };
-    if (state.phase === 'closed') video.play().catch(() => {});
+  if (state.videoState) {
+    applyVideoCommand(state.videoState, false);
   }
 }
 
@@ -669,6 +732,7 @@ function publicContent() {
   if (s.phase === 'open') {
     return `${roundBadgesHtml(s)}
       <h1>${esc(s.round.question)}</h1>
+      ${role === 'screen' ? videoStageHtml(s) : ''}
       ${timerBarHtml()}
       ${options()}
       <p class="muted"><strong>${s.received}</strong> de ${s.playerCount} respuestas recibidas</p>`;
@@ -773,7 +837,13 @@ function player() {
             }</p>`
           : ''
       }
-      ${p.score !== undefined ? `<p class="muted">Puntaje total: <strong>${p.score.toLocaleString('es-CL')} pts</strong> ${p.rank ? `(Puesto #${p.rank})` : ''}</p>` : ''}
+      ${
+        p.score !== undefined
+          ? `<p class="muted">Puntaje total: <strong>${p.score.toLocaleString('es-CL')} pts</strong> ${
+              p.rank ? `(Puesto #${p.rank})` : ''
+            }</p>`
+          : ''
+      }
     </section>`;
   }
   app.innerHTML =
@@ -805,13 +875,36 @@ function player() {
 }
 
 const help = `<details>
-  <summary>📖 Guía rápida para conducir la partida (Zoom / OBS / Proyector)</summary>
+  <summary>📖 Cómo cargar tus propios videos y controlarlos en vivo</summary>
   <ol>
-    <li><strong>Prepara las preguntas:</strong> Carga uno de los packs precargados o añade tus propias preguntas con opción de video integrado (URL MP4 + segundo de corte).</li>
-    <li><strong>Video integrado o Reproductor externo:</strong> Si defines un enlace de video (ej. <code>/demo.mp4</code> y corte en <code>2.2</code> s), la Pantalla Gigante reproducirá el clip y se pausará sola en el corte. También puedes usar VLC/OBS en tu PC si usas películas locales.</li>
-    <li><strong>Control de tiempos:</strong> Pulsa <em>Abrir respuestas</em> cuando todos hayan visto el corte. Al cerrar, muestra el desenlace del video y luego revela los resultados con gráficos de votación.</li>
+    <li><strong>Opción A — Subir clip directo a la nube (hasta 3 MB):</strong> Al crear o editar una pregunta, elige tu archivo <code>.mp4</code> o <code>.webm</code> y pulsa <em>"☁️ Subir clip al servidor"</em>. Quedará guardado en Upstash Redis y se reproducirá en cualquier TV o navegador automáticamente.</li>
+    <li><strong>Opción B — Archivo grande local en el mismo PC (sin límite de peso):</strong> Si tienes un video pesado (ej. 50 MB), selecciónalo y pulsa <em>"💻 Usar como archivo local"</em>. Luego, en la ventana de <strong>Pantalla Gigante</strong>, haz clic arriba en <em>"📂 Videos locales"</em> y selecciona tus archivos MP4.</li>
+    <li><strong>Marcar tiempos con vista previa:</strong> Usa el reproductor de vista previa en el editor y pulsa <em>"✂️ Capturar segundo actual como Corte"</em> en el instante exacto del suspenso.</li>
+    <li><strong>Control Remoto en Vivo:</strong> Durante la ronda verás la botonera <strong>🎮 Control Remoto del Video</strong> para <strong>Pausar</strong>, <strong>Continuar (Play)</strong>, <strong>Reiniciar escena (0s)</strong>, <strong>Ir al corte</strong> o <strong>Reproducir desenlace</strong> cuando tú quieras.</li>
   </ol>
 </details>`;
+
+function remoteVideoControlsHtml(s) {
+  if (!s.round?.videoUrl) return '';
+  const vs = s.videoState || { status: 'paused', position: 0 };
+  const isPlaying = vs.status === 'playing';
+  return `<div class="remote-video-box">
+    <div class="row" style="justify-content:space-between;margin-bottom:12px">
+      <strong>🎮 Control Remoto del Video en Pantalla Gigante</strong>
+      <span class="pill ${isPlaying ? 'pill-live' : 'pill-gold'}">${
+    isPlaying ? '▶ Reproduciendo en TV' : '⏸ Pausado en TV'
+  }</span>
+    </div>
+    <div class="remote-btn-grid">
+      <button type="button" class="remote-btn ${!isPlaying ? 'primary-soft' : ''}" data-vcmd="${isPlaying ? 'pause' : 'play'}">
+        ${isPlaying ? '⏸ Pausar video ahora' : '▶ Continuar / Reproducir'}
+      </button>
+      <button type="button" class="remote-btn" data-vcmd="restart">⏮ Reiniciar desde 0:00</button>
+      <button type="button" class="remote-btn" data-vcmd="to-cut">✂️ Pausar en el corte (${s.round.cutTime ?? 0}s)</button>
+      <button type="button" class="remote-btn" data-vcmd="play-reveal">🍿 Reproducir desenlace (desde ${s.round.cutTime ?? 0}s)</button>
+    </div>
+  </div>`;
+}
 
 function host() {
   app.className = 'admin host';
@@ -824,8 +917,8 @@ function host() {
   }
   const action = {
     lobby: ['prepare', '🎬 Preparar primera ronda'],
-    watching: ['open', '🔓 Abrir respuestas'],
-    open: ['close', '🔒 Cerrar respuestas ahora'],
+    watching: ['open', '🔓 Abrir respuestas (y pausar en el corte)'],
+    open: ['close', '🔒 Cerrar respuestas (y reproducir desenlace)'],
     closed: ['results', '✨ Mostrar resultados y estadísticas'],
     results: ['ranking', '🏆 Mostrar ranking y podio'],
     ranking: s.index + 1 < s.roundCount ? ['prepare', '🎬 Preparar siguiente ronda'] : ['finish', '🎉 Finalizar partida']
@@ -866,6 +959,7 @@ function host() {
       ${
         s.round
           ? `<h2>${esc(s.round.question)}</h2>
+            ${remoteVideoControlsHtml(s)}
             ${options()}
             <p class="muted">
               ${s.round.practice ? 'Ensayo sin puntos' : '1.000 puntos base por acierto'}
@@ -875,8 +969,8 @@ function host() {
             </p>`
           : '<p class="muted">Prepara las rondas abajo y pulsa "Preparar primera ronda" para comenzar.</p>'
       }
-      ${s.phase === 'watching' ? '<p class="director-hint">⏸️ Reproduce el video hasta el corte antes de abrir las respuestas.</p>' : ''}
-      ${s.phase === 'closed' ? '<p class="director-hint">▶️ Reproduce el desenlace del video antes de revelar la respuesta correcta.</p>' : ''}
+      ${s.phase === 'watching' ? '<p class="director-hint">🎬 El video se está mostrando en la Pantalla Gigante. Puedes pausarlo/continuarlo arriba o abrir las respuestas.</p>' : ''}
+      ${s.phase === 'closed' ? '<p class="director-hint">🍿 Mostrando el desenlace del video antes de revelar la respuesta correcta.</p>' : ''}
       ${s.phase === 'open' ? `${timerBarHtml()}<p><strong>${s.received}</strong> de ${s.playerCount} respuestas recibidas</p>` : ''}
       ${
         action
@@ -900,84 +994,129 @@ function host() {
               <label><input type="checkbox" id="opt-speed" ${s.settings?.speedBonus ? 'checked' : ''}> ⚡ Bono por rapidez (+300 máx)</label>
               <label><input type="checkbox" id="opt-streak" ${s.settings?.streakBonus ? 'checked' : ''}> 🔥 Bono por racha consecutiva</label>
             </div>
-          </section>
-
-          <details id="editor" ${editingRound ? 'open' : ''}>
-            <summary>${editingRound ? '✏️ Editando pregunta' : '➕ Añadir o editar pregunta personalizada'}</summary>
-            <form id="round">
-              <label>Pregunta
-                <input name="question" maxlength="180" required value="${esc(editingRound?.question || '')}" placeholder="¿Qué sucede justo después de que se abre la puerta?">
-              </label>
-              ${letters
-                .map(
-                  (l, i) =>
-                    `<label>Alternativa ${l}
-                      <input name="option${i}" maxlength="80" required value="${esc(editingRound?.options?.[i] || '')}">
-                    </label>`
-                )
-                .join('')}
-              <label>Respuesta Correcta
-                <select name="correct">
-                  ${letters
-                    .map(
-                      (l, i) =>
-                        `<option value="${i}" ${editingRound?.correct === i ? 'selected' : ''}>Alternativa ${l}</option>`
-                    )
-                    .join('')}
-                </select>
-              </label>
-              <label>Segundos para responder (10–120)
-                <input type="number" min="10" max="120" value="${editingRound?.seconds || 25}" name="seconds" required>
-              </label>
-              <label>Categoría o etiqueta (opcional)
-                <input name="category" maxlength="40" value="${esc(editingRound?.category || '')}" placeholder="Ej: Clásicos, Acción, Humor">
-              </label>
-              <label>URL de Video MP4 (opcional, ej: <code>/demo.mp4</code>)
-                <input name="videoUrl" maxlength="300" value="${esc(editingRound?.videoUrl || '')}" placeholder="/demo.mp4 o https://...">
-              </label>
-              <label>Segundo de corte automático (opcional, ej: <code>2.2</code>)
-                <input type="number" step="0.1" min="0" name="cutTime" value="${editingRound?.cutTime ?? ''}" placeholder="2.2">
-              </label>
-              <label>Segundo final del desenlace (opcional, ej: <code>5.0</code>)
-                <input type="number" step="0.1" min="0" name="endTime" value="${editingRound?.endTime ?? ''}" placeholder="5.0">
-              </label>
-              <label><input type="checkbox" name="practice" ${editingRound?.practice ? 'checked' : ''}> Ronda de ensayo (sin puntos)</label>
-              <div class="row" style="grid-column:1/-1">
-                <button class="primary">${editingRound ? 'Guardar cambios' : 'Guardar pregunta'}</button>
-                ${editingRound ? '<button type="button" id="cancel-edit" class="quiet">Cancelar edición</button>' : ''}
-              </div>
-            </form>
-          </details>
-
-          <h2>Preguntas preparadas (${s.roundCount})</h2>
-          <div class="rounds-list">
-            ${s.rounds
-              .map(
-                (q, i) =>
-                  `<div class="rank round-item">
-                    <div>
-                      <strong>${i + 1}. ${esc(q.question)}</strong>
-                      <div class="muted small-meta">
-                        ✓ ${letters[q.correct]}: ${esc(q.options[q.correct])} · ⏱️ ${q.seconds}s
-                        ${q.practice ? ' · 🧪 Ensayo' : ''}
-                        ${q.category ? ` · 🏷️ ${esc(q.category)}` : ''}
-                        ${q.videoUrl ? ` · 🎬 Video (${q.cutTime ?? 0}s)` : ''}
-                      </div>
-                    </div>
-                    <div class="round-actions">
-                      <button type="button" data-move="up" data-id="${q.id}" ${i === 0 ? 'disabled' : ''} title="Subir">↑</button>
-                      <button type="button" data-move="down" data-id="${q.id}" ${
-                    i === s.rounds.length - 1 ? 'disabled' : ''
-                  } title="Bajar">↓</button>
-                      <button type="button" data-edit="${q.id}">Editar</button>
-                      <button type="button" data-delete="${q.id}">Eliminar</button>
-                    </div>
-                  </div>`
-              )
-              .join('')}
-          </div>`
+          </section>`
         : ''
     }
+
+    <details id="editor" ${editingRound ? 'open' : ''}>
+      <summary>${
+        editingRound ? '✏️ Editando pregunta y video' : '➕ Añadir pregunta o cargar nuevo video'
+      }</summary>
+      <form id="round">
+        <label>Pregunta
+          <input name="question" maxlength="180" required value="${esc(
+            editingRound?.question || ''
+          )}" placeholder="¿Qué sucede justo después de que se abre la puerta?">
+        </label>
+        ${letters
+          .map(
+            (l, i) =>
+              `<label>Alternativa ${l}
+                <input name="option${i}" maxlength="80" required value="${esc(editingRound?.options?.[i] || '')}">
+              </label>`
+          )
+          .join('')}
+        <label>Respuesta Correcta
+          <select name="correct">
+            ${letters
+              .map(
+                (l, i) =>
+                  `<option value="${i}" ${editingRound?.correct === i ? 'selected' : ''}>Alternativa ${l}</option>`
+              )
+              .join('')}
+          </select>
+        </label>
+        <label>Segundos para responder (10–120)
+          <input type="number" min="10" max="120" value="${editingRound?.seconds || 25}" name="seconds" required>
+        </label>
+        <label>Categoría o etiqueta (opcional)
+          <input name="category" maxlength="40" value="${esc(editingRound?.category || '')}" placeholder="Ej: Clásicos, Acción, Humor">
+        </label>
+        <label style="align-self:end"><input type="checkbox" name="practice" ${
+          editingRound?.practice ? 'checked' : ''
+        }> Ronda de ensayo (sin puntos)</label>
+
+        <div class="video-uploader-box" style="grid-column:1/-1">
+          <h3>🎬 Cargar o vincular video para esta pregunta</h3>
+          <div class="row">
+            <input type="file" id="video-file-input" accept="video/mp4,video/webm,video/quicktime" style="margin:0;flex:1">
+            <button type="button" id="btn-upload-cloud" class="primary-soft">☁️ Subir clip al servidor (máx 3 MB)</button>
+            <button type="button" id="btn-use-local" class="quiet">💻 Usar archivo pesado en modo local</button>
+          </div>
+          <small class="muted" id="upload-status">Puedes subir un clip corto a la nube, elegir un archivo local o pegar un enlace directo (.mp4).</small>
+
+          <label style="margin-top:12px">URL o ruta del video
+            <input name="videoUrl" id="input-video-url" maxlength="500" value="${esc(
+              editingRound?.videoUrl || ''
+            )}" placeholder="/demo.mp4, /api/game?media=..., o https://...">
+          </label>
+
+          <div class="preview-stage">
+            <video id="editor-preview-video" src="${esc(
+              editingRound?.videoUrl && !editingRound.videoUrl.startsWith('local:') ? editingRound.videoUrl : '/demo.mp4'
+            )}" controls preload="metadata"></video>
+            <div class="row" style="margin-top:10px">
+              <button type="button" id="btn-set-cut">✂️ Capturar segundo actual como Corte</button>
+              <button type="button" id="btn-set-end">🏁 Capturar segundo actual como Final</button>
+            </div>
+          </div>
+
+          <div class="grid" style="margin-top:12px">
+            <label>Segundo de corte automático (pausa antes de responder)
+              <input type="number" step="0.1" min="0" name="cutTime" id="input-cut-time" value="${
+                editingRound?.cutTime ?? ''
+              }" placeholder="Ej: 4.5">
+            </label>
+            <label>Segundo final del desenlace (opcional)
+              <input type="number" step="0.1" min="0" name="endTime" id="input-end-time" value="${
+                editingRound?.endTime ?? ''
+              }" placeholder="Ej: 12.0">
+            </label>
+          </div>
+        </div>
+
+        <div class="row" style="grid-column:1/-1;margin-top:12px">
+          <button class="primary">${editingRound ? 'Guardar cambios' : 'Guardar pregunta'}</button>
+          ${editingRound ? '<button type="button" id="cancel-edit" class="quiet">Cancelar edición</button>' : ''}
+        </div>
+      </form>
+    </details>
+
+    <h2>Preguntas de la sala (${s.roundCount})</h2>
+    <div class="rounds-list">
+      ${s.rounds
+        .map(
+          (q, i) =>
+            `<div class="rank round-item">
+              <div>
+                <strong>${i + 1}. ${esc(q.question)}</strong>
+                <div class="muted small-meta">
+                  ✓ ${letters[q.correct]}: ${esc(q.options[q.correct])} · ⏱️ ${q.seconds}s
+                  ${q.practice ? ' · 🧪 Ensayo' : ''}
+                  ${q.category ? ` · 🏷️ ${esc(q.category)}` : ''}
+                  ${
+                    q.videoUrl
+                      ? ` · 🎬 Video (${q.cutTime !== null ? 'corte ' + q.cutTime + 's' : 'sin corte automático'})`
+                      : ' · Sin video'
+                  }
+                </div>
+              </div>
+              <div class="round-actions">
+                ${
+                  s.phase === 'lobby'
+                    ? `<button type="button" data-move="up" data-id="${q.id}" ${i === 0 ? 'disabled' : ''} title="Subir">↑</button>
+                       <button type="button" data-move="down" data-id="${q.id}" ${
+                        i === s.rounds.length - 1 ? 'disabled' : ''
+                      } title="Bajar">↓</button>`
+                    : ''
+                }
+                <button type="button" data-edit="${q.id}">Editar / Video</button>
+                ${s.phase === 'lobby' ? `<button type="button" data-delete="${q.id}">Eliminar</button>` : ''}
+              </div>
+            </div>`
+        )
+        .join('')}
+    </div>
 
     ${['results', 'ranking', 'finished'].includes(s.phase) ? ranking() : ''}
 
@@ -1012,9 +1151,10 @@ function host() {
     }
   };
   if ($('#action'))
-    $('#action').onclick = () => {
+    $('#action').onclick = async () => {
       sfx.click();
-      mutate({ op: 'action', action: action[0], expectedPhase: s.phase, expectedIndex: s.index });
+      await mutate({ op: 'action', action: action[0], expectedPhase: s.phase, expectedIndex: s.index });
+      bc?.postMessage({ type: 'refresh' });
     };
   if ($('#reset-game'))
     $('#reset-game').onclick = () => {
@@ -1022,6 +1162,105 @@ function host() {
         mutate({ op: 'reset' });
       }
     };
+
+  // Remote video control buttons
+  document.querySelectorAll('[data-vcmd]').forEach(btn => {
+    btn.onclick = async () => {
+      sfx.click();
+      const cmd = btn.dataset.vcmd;
+      try {
+        const res = await request({ op: 'video-control', cmd });
+        if (res.videoState) {
+          bc?.postMessage({ type: 'video-cmd', videoState: res.videoState });
+        }
+        await refresh(true);
+      } catch (err) {
+        notice(err.message);
+      }
+    };
+  });
+
+  // Video file uploader & preview bindings in Editor
+  const fileInput = $('#video-file-input');
+  const urlInput = $('#input-video-url');
+  const previewVideo = $('#editor-preview-video');
+  const statusEl = $('#upload-status');
+
+  if (fileInput && previewVideo) {
+    fileInput.onchange = () => {
+      const f = fileInput.files?.[0];
+      if (!f) return;
+      const blobUrl = URL.createObjectURL(f);
+      previewVideo.src = blobUrl;
+      const sizeMb = (f.size / (1024 * 1024)).toFixed(2);
+      statusEl.textContent = `Archivo seleccionado: ${f.name} (${sizeMb} MB). Usa la vista previa abajo para marcar el corte o súbelo al servidor.`;
+    };
+  }
+  if (urlInput && previewVideo) {
+    urlInput.oninput = () => {
+      const v = urlInput.value.trim();
+      if (v && !v.startsWith('local:')) previewVideo.src = v;
+    };
+  }
+  if ($('#btn-upload-cloud')) {
+    $('#btn-upload-cloud').onclick = async () => {
+      const f = fileInput?.files?.[0];
+      if (!f) return notice('Primero selecciona un archivo de video (.mp4 / .webm).');
+      if (f.size > 3 * 1024 * 1024) {
+        return notice('El archivo supera los 3 MB para subida en la nube. Usa el botón "💻 Usar archivo pesado en modo local" o un clip más corto.');
+      }
+      const btn = $('#btn-upload-cloud');
+      btn.disabled = true;
+      statusEl.textContent = 'Subiendo video al servidor…';
+      try {
+        const base64 = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const str = String(reader.result || '');
+            resolve(str.includes(',') ? str.split(',')[1] : str);
+          };
+          reader.onerror = reject;
+          reader.readAsDataURL(f);
+        });
+        const uploaded = await request({ op: 'upload-video', name: f.name, mime: f.type || 'video/mp4', data: base64 });
+        urlInput.value = uploaded.videoUrl;
+        previewVideo.src = uploaded.videoUrl;
+        statusEl.textContent = `✅ ¡Video subido con éxito! (${uploaded.videoUrl})`;
+        notice('Video subido y vinculado a la pregunta.');
+      } catch (err) {
+        statusEl.textContent = '❌ Error al subir: ' + err.message;
+        notice(err.message);
+      } finally {
+        btn.disabled = false;
+      }
+    };
+  }
+  if ($('#btn-use-local')) {
+    $('#btn-use-local').onclick = () => {
+      const f = fileInput?.files?.[0];
+      if (!f) return notice('Primero selecciona un archivo de video desde tu computador.');
+      urlInput.value = 'local:' + f.name;
+      statusEl.textContent = `💻 Configurado como archivo local (${f.name}). Recuerda seleccionarlo también en el botón "📂 Videos locales" de la Pantalla Gigante.`;
+      notice('Vinculado como archivo local: ' + f.name);
+    };
+  }
+  if ($('#btn-set-cut') && previewVideo) {
+    $('#btn-set-cut').onclick = () => {
+      previewVideo.pause();
+      const t = Math.round(previewVideo.currentTime * 10) / 10;
+      $('#input-cut-time').value = t;
+      notice(`Segundo de corte fijado en ${t} s.`);
+    };
+  }
+  if ($('#btn-set-end') && previewVideo) {
+    $('#btn-set-end').onclick = () => {
+      previewVideo.pause();
+      const t = Math.round(previewVideo.currentTime * 10) / 10;
+      $('#input-end-time').value = t;
+      notice(`Segundo final fijado en ${t} s.`);
+    };
+  }
+
   if ($('#round'))
     $('#round').onsubmit = async e => {
       e.preventDefault();
@@ -1089,6 +1328,7 @@ function host() {
       editingRoundId = btn.dataset.edit;
       host();
       status();
+      $('#editor')?.scrollIntoView({ behavior: 'smooth' });
     };
   });
   document.querySelectorAll('[data-move]').forEach(btn => {
@@ -1154,13 +1394,16 @@ async function refresh(force = false) {
   if (s.round?.id !== lastRound) {
     lastRound = s.round?.id;
     selection = null;
+    lastVideoSeq = -1;
   }
   handlePhaseEffects(s);
-  const key = JSON.stringify({ ...s, serverNow: 0, reactions: [] });
+  const key = JSON.stringify({ ...s, serverNow: 0, reactions: [], videoState: role === 'host' ? s.videoState : null });
   const editing = role === 'host' && $('#editor')?.open;
   if ((key !== viewKey && !editing) || force) {
     viewKey = key;
     render();
+  } else {
+    syncRoundVideo();
   }
   status();
 }
@@ -1179,7 +1422,7 @@ async function poll() {
       app.innerHTML = header() + `<h1>No pudimos conectar</h1><p>${esc(e.message)}</p><p>Volveremos a intentarlo automáticamente.</p>`;
   } finally {
     polling = false;
-    setTimeout(poll, 2200);
+    setTimeout(poll, 1800);
   }
 }
 

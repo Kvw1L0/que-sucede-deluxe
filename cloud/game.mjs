@@ -132,9 +132,15 @@ export function round(input) {
     400
   );
 
-  const videoUrl = typeof input.videoUrl === 'string' ? input.videoUrl.trim().slice(0, 300) : '';
-  const cutTime = Number.isFinite(Number(input.cutTime)) && Number(input.cutTime) >= 0 ? Number(input.cutTime) : null;
-  const endTime = Number.isFinite(Number(input.endTime)) && Number(input.endTime) > 0 ? Number(input.endTime) : null;
+  const videoUrl = typeof input.videoUrl === 'string' ? input.videoUrl.trim().slice(0, 500) : '';
+  const cutTime =
+    input.cutTime !== null && input.cutTime !== '' && Number.isFinite(Number(input.cutTime)) && Number(input.cutTime) >= 0
+      ? Number(input.cutTime)
+      : null;
+  const endTime =
+    input.endTime !== null && input.endTime !== '' && Number.isFinite(Number(input.endTime)) && Number(input.endTime) > 0
+      ? Number(input.endTime)
+      : null;
   const category = typeof input.category === 'string' ? input.category.trim().slice(0, 40) : '';
 
   return {
@@ -164,15 +170,39 @@ export function advance(r, action, now) {
     r.index++;
     r.phase = 'watching';
     r.phaseStartedAt = now;
+    const q = r.rounds[r.index];
+    r.videoState = {
+      status: 'playing',
+      position: 0,
+      stopAt: q?.cutTime ?? null,
+      seq: (r.videoState?.seq || 0) + 1,
+      updatedAt: now
+    };
   } else if (action === 'open') {
     is('watching');
     r.phase = 'open';
     r.openedAt = now;
     r.deadline = now + r.rounds[r.index].seconds * 1000;
+    const q = r.rounds[r.index];
+    r.videoState = {
+      status: 'paused',
+      position: q?.cutTime ?? r.videoState?.position ?? 0,
+      stopAt: q?.cutTime ?? null,
+      seq: (r.videoState?.seq || 0) + 1,
+      updatedAt: now
+    };
   } else if (action === 'close') {
     is('open');
     r.phase = 'closed';
     r.closedAt = now;
+    const q = r.rounds[r.index];
+    r.videoState = {
+      status: 'playing',
+      position: q?.cutTime ?? 0,
+      stopAt: q?.endTime ?? null,
+      seq: (r.videoState?.seq || 0) + 1,
+      updatedAt: now
+    };
   } else if (action === 'results') {
     is('closed');
     r.phase = 'results';
@@ -186,6 +216,41 @@ export function advance(r, action, now) {
   } else {
     check(false, 'Acción desconocida.', 400);
   }
+}
+
+export function controlVideo(r, b, now) {
+  const q = r.rounds[r.index];
+  check(q, 'Primero prepara una ronda para controlar el video.');
+  const vs = r.videoState || { status: 'paused', position: 0, stopAt: q.cutTime ?? null, seq: 0, updatedAt: now };
+  const cmd = b.cmd;
+  if (cmd === 'play') {
+    vs.status = 'playing';
+    if (Number.isFinite(Number(b.position))) vs.position = Math.max(0, Number(b.position));
+    if (b.stopAt !== undefined) vs.stopAt = Number.isFinite(Number(b.stopAt)) ? Number(b.stopAt) : null;
+  } else if (cmd === 'pause') {
+    vs.status = 'paused';
+    if (Number.isFinite(Number(b.position))) vs.position = Math.max(0, Number(b.position));
+  } else if (cmd === 'restart') {
+    vs.status = 'playing';
+    vs.position = 0;
+    vs.stopAt = q.cutTime ?? null;
+  } else if (cmd === 'to-cut') {
+    vs.status = 'paused';
+    vs.position = q.cutTime ?? 0;
+    vs.stopAt = q.cutTime ?? null;
+  } else if (cmd === 'play-reveal') {
+    vs.status = 'playing';
+    vs.position = q.cutTime ?? 0;
+    vs.stopAt = q.endTime ?? null;
+  } else if (cmd === 'seek') {
+    if (Number.isFinite(Number(b.position))) vs.position = Math.max(0, Number(b.position));
+    if (b.status === 'playing' || b.status === 'paused') vs.status = b.status;
+  } else {
+    check(false, 'Comando de video desconocido.', 400);
+  }
+  vs.seq = (vs.seq || 0) + 1;
+  vs.updatedAt = now;
+  r.videoState = vs;
 }
 
 export function answer(r, p, b, now) {
@@ -220,8 +285,6 @@ export function answer(r, p, b, now) {
     } else {
       p.streak = 0;
     }
-  } else if (correct) {
-    // Practice round doesn't break streak, nor add points
   }
 
   const points = base + speedBonus + streakBonus;
@@ -255,6 +318,7 @@ export function snapshot(r, role, p, now) {
     openedAt: r.openedAt || null,
     playerCount: r.players.length,
     settings,
+    videoState: r.videoState || { status: 'paused', position: 0, stopAt: q?.cutTime ?? null, seq: 0, updatedAt: now },
     reactions: (r.reactions || []).filter(rx => now - rx.at < 8000).slice(-25)
   };
 
@@ -285,7 +349,6 @@ export function snapshot(r, role, p, now) {
 
   out.received = roundAnswers.length;
 
-  // Vote distribution for results/ranking/host
   if (q && (reveal || role === 'host')) {
     const counts = [0, 0, 0, 0];
     for (const ans of roundAnswers) {

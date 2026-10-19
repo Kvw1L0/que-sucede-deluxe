@@ -92,3 +92,22 @@
 .kick-btn{min-height:32px;padding:4px 9px;font-size:.75rem;border-radius:8px;background:#ffeceb;color:#9c2b23;border-color:#f2c6c2}
 .host-top-links{justify-content:space-between;margin-bottom:8px}
 .director-hint{background:#fff3d1;color:#6b4700;padding:10px 14px;border-radius:10px;font-size:.88rem;font-weight:700}
+
+/* --- Video Uploader & Remote Control Deck --- */
+.remote-video-box{background:#0e292c;color:white;border-radius:18px;padding:18px 20px;margin:16px 0 22px;box-shadow:0 12px 28px #0e292c25}
+.remote-video-box strong{color:#f5d898}
+.remote-btn-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
+.remote-btn{background:#184247;color:white;border:1px solid #2e666c;min-height:48px;padding:10px 14px;font-size:.85rem;border-radius:10px}
+.remote-btn:hover{background:#21585e}
+.remote-btn.primary-soft,.primary-soft{background:#d59b2d;color:#14282a;border-color:#d59b2d;font-weight:800}
+.remote-btn.primary-soft:hover,.primary-soft:hover{background:#e3ab3e}
+.pill-live{background:#198754;color:white}
+
+.video-uploader-box{background:#f3f8f6;border:2px dashed #9fc0ba;border-radius:16px;padding:20px;margin-top:10px}
+.video-uploader-box h3{margin:0 0 12px;font-size:1.05rem;color:#005f67}
+.preview-stage{margin-top:14px;background:#0e292c;padding:14px;border-radius:14px;color:white}
+.preview-stage video{width:100%;max-height:280px;border-radius:10px;background:black;display:block}
+.preview-stage button{min-height:42px;padding:8px 14px;font-size:.82rem;background:#fffdf8;color:#163f43}
+.local-video-label{cursor:pointer;display:inline-flex;align-items:center;margin:0}
+.missing-local-video{padding:28px;background:#1a3c40;border:2px dashed #f5d898;border-radius:14px;color:#fff8e6}
+

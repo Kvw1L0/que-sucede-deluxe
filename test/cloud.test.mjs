@@ -152,3 +152,52 @@ test('la sesión rechaza firmas alteradas, expiración y cambio de clave', () =>
   assert.equal(adminSession(req, 'secret', Date.now() + 31 * 86400000), false);
   assert.match(value, /Secure/);
 });
+
+test('carga de video y control remoto (Play, Pausa, Corte, Desenlace) desde el administrador', async t => {
+  const db = new MemoryStore(),
+    env = { HOST_KEY: 'video-secret' },
+    server = http.createServer(handler(db, env));
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  t.after(() => server.close());
+  const base = 'http://127.0.0.1:' + server.address().port;
+
+  async function call(b, token) {
+    const res = await fetch(base + '/api/game', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) },
+      body: JSON.stringify(b)
+    });
+    return { status: res.status, ...(await res.json()) };
+  }
+
+  const { code, hostToken } = await call({ op: 'create', title: 'Sala Video', key: 'video-secret' });
+  const fakeVideoBase64 = Buffer.from('fake-mp4-binary-content').toString('base64');
+  const up = await call({ op: 'upload-video', code, name: 'escena.mp4', mime: 'video/mp4', data: fakeVideoBase64 }, hostToken);
+  assert.equal(up.status, 200);
+  assert.match(up.videoUrl, /^\/api\/game\?media=/);
+
+  const mediaRes = await fetch(base + up.videoUrl);
+  assert.equal(mediaRes.status, 200);
+  assert.equal(mediaRes.headers.get('content-type'), 'video/mp4');
+  assert.equal(await mediaRes.text(), 'fake-mp4-binary-content');
+
+  await call({ op: 'round', code, ...definition, videoUrl: up.videoUrl, cutTime: 3.5, endTime: 8.0 }, hostToken);
+  await call({ op: 'action', code, action: 'prepare', expectedPhase: 'lobby', expectedIndex: -1 }, hostToken);
+
+  const pauseRes = await call({ op: 'video-control', code, cmd: 'pause' }, hostToken);
+  assert.equal(pauseRes.status, 200);
+  assert.equal(pauseRes.videoState.status, 'paused');
+
+  const playRes = await call({ op: 'video-control', code, cmd: 'play' }, hostToken);
+  assert.equal(playRes.videoState.status, 'playing');
+
+  const cutRes = await call({ op: 'video-control', code, cmd: 'to-cut' }, hostToken);
+  assert.equal(cutRes.videoState.status, 'paused');
+  assert.equal(cutRes.videoState.position, 3.5);
+
+  const revRes = await call({ op: 'video-control', code, cmd: 'play-reveal' }, hostToken);
+  assert.equal(revRes.videoState.status, 'playing');
+  assert.equal(revRes.videoState.position, 3.5);
+  assert.equal(revRes.videoState.stopAt, 8.0);
+});
+

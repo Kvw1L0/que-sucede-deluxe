@@ -1,4 +1,4 @@
-import { token, hash, check, round, advance, answer, snapshot, QUESTION_TEMPLATES } from '../cloud/game.mjs';
+import { token, hash, check, round, advance, controlVideo, answer, snapshot, QUESTION_TEMPLATES } from '../cloud/game.mjs';
 import { RedisStore, update } from '../cloud/store.mjs';
 import QRCode from 'qrcode';
 import { adminSession, setAdminCookie } from '../cloud/admin.mjs';
@@ -11,6 +11,29 @@ const ALLOWED_EMOJIS = ['👏', '😂', '😱', '🔥', '🎉', '🤔', '❤️'
 
 export function handler(db = store, env = process.env) {
   return async (req, res) => {
+    const url = new URL(req.url, 'http://localhost');
+
+    // Serve uploaded video clips directly if media=<id> is requested
+    const mediaId = url.searchParams.get('media');
+    if (req.method === 'GET' && mediaId) {
+      try {
+        check(/^[A-Za-z0-9_-]{6,40}$/.test(mediaId), 'ID de video inválido.', 400);
+        const rawMedia = await db.readMedia(mediaId);
+        check(rawMedia, 'Video no encontrado o caducado.', 404);
+        const parsed = JSON.parse(rawMedia);
+        const buf = Buffer.from(parsed.data, 'base64');
+        res.setHeader('Content-Type', parsed.mime || 'video/mp4');
+        res.setHeader('Content-Length', buf.length);
+        res.setHeader('Accept-Ranges', 'bytes');
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+        res.statusCode = 200;
+        return res.end(buf);
+      } catch (e) {
+        res.statusCode = e.status || 500;
+        return res.end(e.message || 'Error al cargar video.');
+      }
+    }
+
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -20,7 +43,6 @@ export function handler(db = store, env = process.env) {
     };
     try {
       check(['GET', 'POST'].includes(req.method), 'Método no permitido.', 405);
-      const url = new URL(req.url, 'http://localhost');
       let b = {};
       if (req.method === 'POST') {
         check((req.headers['content-type'] || '').includes('application/json'), 'Envía JSON.', 415);
@@ -30,14 +52,14 @@ export function handler(db = store, env = process.env) {
           let raw = '';
           for await (const chunk of req) {
             raw += chunk;
-            check(Buffer.byteLength(raw) <= 64000, 'Solicitud demasiado grande.', 413);
+            check(Buffer.byteLength(raw) <= 4500000, 'El archivo supera el límite de 3 MB para subida directa.', 413);
           }
           b = JSON.parse(raw || '{}');
         }
         check(b && typeof b === 'object', 'Solicitud inválida.', 400);
       }
 
-      const hostKey = env === process.env ? (env.HOST_KEY || 'deluxe') : env.HOST_KEY;
+      const hostKey = env === process.env ? env.HOST_KEY || 'deluxe' : env.HOST_KEY;
       const op = req.method === 'GET' ? 'state' : b.op;
       const isAdmin = adminSession(req, hostKey);
       const secure = !!env.VERCEL || req.headers['x-forwarded-proto'] === 'https';
@@ -83,6 +105,7 @@ export function handler(db = store, env = process.env) {
             players: [],
             answers: {},
             reactions: [],
+            videoState: { status: 'paused', position: 0, stopAt: null, seq: 0, updatedAt: Date.now() },
             settings: {
               speedBonus: b.speedBonus === true,
               streakBonus: b.streakBonus === true
@@ -101,7 +124,20 @@ export function handler(db = store, env = process.env) {
         if (
           isAdmin &&
           ((req.method === 'GET' && url.searchParams.get('view') === 'host') ||
-            ['round', 'edit-round', 'move-round', 'template', 'import', 'settings', 'reset', 'kick', 'delete', 'action'].includes(op))
+            [
+              'round',
+              'edit-round',
+              'move-round',
+              'template',
+              'import',
+              'settings',
+              'reset',
+              'kick',
+              'delete',
+              'action',
+              'video-control',
+              'upload-video'
+            ].includes(op))
         ) {
           return { role: 'host' };
         }
@@ -125,6 +161,19 @@ export function handler(db = store, env = process.env) {
         check(raw, 'Sala no encontrada.', 404);
         check(typeof b.origin === 'string' && /^https?:\/\//.test(b.origin), 'Dirección inválida.', 400);
         return send(200, { image: await QRCode.toDataURL(new URL('/j/' + code, b.origin).href, { width: 300, margin: 2 }) });
+      }
+
+      if (op === 'upload-video') {
+        const raw = await db.read(code);
+        check(raw, 'Sala no encontrada.', 404);
+        const r = JSON.parse(raw);
+        const { role } = identify(r);
+        check(role === 'host', 'Solo el administrador puede subir videos.', 403);
+        check(typeof b.data === 'string' && b.data.length > 0 && b.data.length <= 4200000, 'El video debe pesar menos de 3 MB.', 400);
+        const mime = ['video/mp4', 'video/webm', 'video/quicktime'].includes(b.mime) ? b.mime : 'video/mp4';
+        const mediaId = token().slice(0, 16);
+        await db.saveMedia(mediaId, JSON.stringify({ mime, name: String(b.name || 'clip.mp4').slice(0, 80), data: b.data }));
+        return send(200, { videoUrl: '/api/game?media=' + mediaId, mediaId });
       }
 
       const newToken = token();
@@ -177,12 +226,14 @@ export function handler(db = store, env = process.env) {
 
         check(role === 'host', 'Solo el administrador puede realizar esta acción.', 403);
 
-        if (op === 'round') {
+        if (op === 'video-control') {
+          controlVideo(r, b, Date.now());
+          return { ok: true, videoState: r.videoState };
+        } else if (op === 'round') {
           check(r.phase === 'lobby', 'Las preguntas se preparan antes de empezar.');
           check(r.rounds.length < 30, 'Máximo 30 rondas.');
           r.rounds.push(round(b));
         } else if (op === 'edit-round') {
-          check(r.phase === 'lobby', 'Las preguntas se editan antes de empezar.');
           const idx = r.rounds.findIndex(q => q.id === b.id);
           check(idx >= 0, 'Pregunta no encontrada.', 404);
           r.rounds[idx] = round({ ...b, id: b.id });
@@ -225,6 +276,7 @@ export function handler(db = store, env = process.env) {
           r.answers = {};
           r.reactions = [];
           r.deadline = null;
+          r.videoState = { status: 'paused', position: 0, stopAt: null, seq: 0, updatedAt: Date.now() };
           for (const pl of r.players) {
             pl.score = 0;
             pl.streak = 0;
