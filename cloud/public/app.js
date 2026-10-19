@@ -1,0 +1,1226 @@
+const $ = s => document.querySelector(s),
+  app = $('#app'),
+  letters = ['A', 'B', 'C', 'D'];
+const esc = s =>
+  String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+const AVATARS = ['🎬', '🍿', '🎭', '🌟', '🦊', '🦁', '🐼', '🐯', '🐸', '🐙', '🦄', '🚀', '⚡', '🎸', '🕵️', '👑'];
+const EMOJIS = ['👏', '😂', '😱', '🔥', '🎉', '🤔', '❤️', '🍿'];
+
+const [, route, code] = location.pathname.split('/');
+const role = ['admin', 'admin.html'].includes(route)
+  ? 'admin'
+  : route === 'play'
+  ? 'entry'
+  : route === 'tv'
+  ? 'tv'
+  : route === 'host'
+  ? 'host'
+  : route === 'j'
+  ? 'player'
+  : route === 'screen'
+  ? 'screen'
+  : 'home';
+
+const storageKey = `qsd-v2-${role}-${code}`;
+let secret = localStorage.getItem(storageKey) || '',
+  state,
+  selection = null,
+  selectedAvatar = localStorage.getItem('qsd-avatar') || '🎬',
+  lastRound = '',
+  lastPhase = '',
+  viewKey = '',
+  online = false,
+  busy = false,
+  offset = 0,
+  qr = '',
+  soundEnabled = localStorage.getItem('qsd-sound') !== 'off',
+  lastTickSecond = -1,
+  editingRoundId = null;
+
+const seenReactions = new Set();
+
+/* --- Web Audio API Sound Engine --- */
+class SoundFX {
+  constructor() {
+    this.ctx = null;
+  }
+  init() {
+    if (!soundEnabled) return false;
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return false;
+    if (!this.ctx) this.ctx = new AudioCtx();
+    if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+    return true;
+  }
+  tone(freq, duration = 0.12, type = 'sine', delay = 0, gainVal = 0.14) {
+    try {
+      if (!this.init()) return;
+      const now = this.ctx.currentTime + delay;
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, now);
+      gain.gain.setValueAtTime(gainVal, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + duration);
+      osc.connect(gain);
+      gain.connect(this.ctx.destination);
+      osc.start(now);
+      osc.stop(now + duration);
+    } catch {}
+  }
+  tick(urgent = false) {
+    this.tone(urgent ? 880 : 540, 0.08, urgent ? 'triangle' : 'sine', 0, urgent ? 0.16 : 0.09);
+  }
+  open() {
+    [440, 554.37, 659.25].forEach((f, i) => this.tone(f, 0.18, 'triangle', i * 0.06, 0.15));
+  }
+  close() {
+    [330, 220].forEach((f, i) => this.tone(f, 0.25, 'sawtooth', i * 0.12, 0.14));
+  }
+  reveal() {
+    [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => this.tone(f, 0.35, 'triangle', i * 0.07, 0.18));
+  }
+  podium() {
+    [440, 554.37, 659.25, 880, 1108.73].forEach((f, i) => this.tone(f, 0.5, 'triangle', i * 0.09, 0.18));
+  }
+  click() {
+    this.tone(660, 0.05, 'sine', 0, 0.08);
+  }
+}
+const sfx = new SoundFX();
+
+/* --- Confetti Celebration --- */
+function launchConfetti() {
+  const canvas = $('#confetti-canvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  const colors = ['#007e88', '#d59b2d', '#00a896', '#f4a261', '#e76f51', '#4755a0'];
+  const pieces = Array.from({ length: 90 }, () => ({
+    x: Math.random() * canvas.width,
+    y: -20 - Math.random() * 200,
+    w: 8 + Math.random() * 8,
+    h: 6 + Math.random() * 6,
+    color: colors[Math.floor(Math.random() * colors.length)],
+    vy: 2.5 + Math.random() * 4,
+    vx: -2 + Math.random() * 4,
+    rot: Math.random() * Math.PI * 2,
+    vrot: -0.1 + Math.random() * 0.2
+  }));
+  let frame = 0;
+  function step() {
+    frame++;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    let alive = false;
+    for (const p of pieces) {
+      p.x += p.vx;
+      p.y += p.vy;
+      p.rot += p.vrot;
+      if (p.y < canvas.height + 30) alive = true;
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      ctx.fillStyle = p.color;
+      ctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
+      ctx.restore();
+    }
+    if (alive && frame < 240) requestAnimationFrame(step);
+    else ctx.clearRect(0, 0, canvas.width, canvas.height);
+  }
+  requestAnimationFrame(step);
+}
+
+/* --- Floating Reactions --- */
+function spawnReactions(list = []) {
+  const layer = $('#reactions-layer');
+  if (!layer || !Array.isArray(list)) return;
+  for (const rx of list) {
+    if (!rx.id || seenReactions.has(rx.id)) continue;
+    seenReactions.add(rx.id);
+    const el = document.createElement('div');
+    el.className = 'floating-reaction';
+    el.style.left = 10 + Math.random() * 80 + '%';
+    el.innerHTML = `<span class="rx-emoji">${esc(rx.emoji)}</span><small>${esc(rx.name)}</small>`;
+    layer.appendChild(el);
+    setTimeout(() => el.remove(), 4200);
+  }
+}
+
+function notice(s) {
+  $('#notice').textContent = s;
+  clearTimeout(notice.timer);
+  if (s) notice.timer = setTimeout(() => ($('#notice').textContent = ''), 8000);
+}
+
+async function request(body) {
+  const res = await fetch('/api/game' + (body ? '' : '?code=' + encodeURIComponent(code) + '&view=' + role), {
+    method: body ? 'POST' : 'GET',
+    headers: { 'Content-Type': 'application/json', ...(secret ? { Authorization: 'Bearer ' + secret } : {}) },
+    body: body ? JSON.stringify({ code, ...body }) : undefined,
+    cache: 'no-store'
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'No se pudo conectar.');
+  return data;
+}
+
+function toggleSound() {
+  soundEnabled = !soundEnabled;
+  localStorage.setItem('qsd-sound', soundEnabled ? 'on' : 'off');
+  if (soundEnabled) sfx.click();
+  const btn = $('#sound-toggle');
+  if (btn) btn.textContent = soundEnabled ? '🔊 Sonido' : '🔇 Silencio';
+}
+
+function toggleFullscreen() {
+  if (!document.fullscreenElement) {
+    document.documentElement.requestFullscreen?.().catch(() => {});
+  } else {
+    document.exitFullscreen?.().catch(() => {});
+  }
+}
+
+function header() {
+  const entry = app.classList.contains('entry');
+  const roleLabel =
+    {
+      admin: 'Administración Deluxe',
+      host: 'Director · privado',
+      player: 'Jugador',
+      screen: 'Pantalla gigante'
+    }[role] || '';
+  return `<header class="${entry ? 'entry-header' : ''}">
+    ${
+      entry
+        ? '<div class="deluxe-badge">EDICIÓN DELUXE</div><h1 class="game-title">¿Qué sucede<br><span>después?</span></h1>'
+        : '<a class="brand" href="/">¿Qué sucede<br><strong>después?</strong> <span class="brand-badge">DELUXE</span></a>'
+    }
+    ${
+      entry
+        ? ''
+        : `<div class="header-meta">
+            <div class="header-tools">
+              <button type="button" id="sound-toggle" class="tool-btn" title="Activar o silenciar efectos de sonido">${
+                soundEnabled ? '🔊 Sonido' : '🔇 Silencio'
+              }</button>
+              ${
+                role === 'screen'
+                  ? '<button type="button" id="fs-toggle" class="tool-btn" title="Pantalla completa">⛶ Pantalla completa</button>'
+                  : ''
+              }
+            </div>
+            <span class="tag">${roleLabel}</span>
+            <span class="connection"></span>
+          </div>`
+    }
+  </header>`;
+}
+
+function bindHeaderTools() {
+  if ($('#sound-toggle')) $('#sound-toggle').onclick = toggleSound;
+  if ($('#fs-toggle')) $('#fs-toggle').onclick = toggleFullscreen;
+}
+
+function status() {
+  const el = $('.connection');
+  if (el) {
+    el.textContent = online ? '● Conectado en vivo' : '○ Sin conexión · reconectando';
+    el.className = 'connection ' + (online ? '' : 'offline');
+  }
+  document.querySelectorAll('[data-live]').forEach(el => {
+    el.disabled = !online || busy || (el.id === 'action' && !state?.roundCount);
+  });
+  bindHeaderTools();
+}
+
+function home() {
+  app.className = 'entry lobby';
+  app.innerHTML =
+    header() +
+    `<p class="subtitle-lead">Trivia interactiva de clips y películas en vivo para TV, proyectores, Zoom y OBS</p>
+    <div class="role-grid">
+      <a class="role-card" href="/tv">
+        <span class="role-icon" aria-hidden="true">▣</span>
+        <h2>Pantalla gigante</h2>
+        <p>Video sincronizado, preguntas, gráfico de votos y podio animado.</p>
+        <span class="role-arrow" aria-hidden="true">→</span>
+      </a>
+      <a class="role-card" href="/play">
+        <span class="role-icon" aria-hidden="true">▯</span>
+        <h2>Jugador</h2>
+        <p>Elige tu avatar, entra a tu sala con PIN o QR y responde a tiempo.</p>
+        <span class="role-arrow" aria-hidden="true">→</span>
+      </a>
+      <a class="role-card" href="/admin.html">
+        <span class="role-icon" aria-hidden="true">☷</span>
+        <h2>Administrador</h2>
+        <p>Crea salas, usa plantillas de preguntas, configura bonos y dirige el show.</p>
+        <span class="role-arrow" aria-hidden="true">→</span>
+      </a>
+    </div>`;
+}
+
+function tvEntry() {
+  app.className = 'entry';
+  app.innerHTML =
+    header() +
+    `<form id="screen-code" class="join-card">
+      <h2>Pantalla gigante</h2>
+      <label>PIN de sala
+        <input class="pin-input" name="code" maxlength="6" minlength="6" required placeholder="123456" inputmode="numeric" autocomplete="off">
+      </label>
+      <button class="primary">Abrir pantalla →</button>
+    </form>
+    <a class="admin-entry" href="/">← Inicio</a>`;
+  $('#screen-code').onsubmit = async e => {
+    e.preventDefault();
+    const c = e.target.elements.code.value.trim().toUpperCase(),
+      btn = e.target.querySelector('button');
+    if (!/^(?:[0-9]{6}|[A-Z2-9]{6})$/.test(c)) return notice('Revisa el PIN de seis caracteres.');
+    btn.disabled = true;
+    try {
+      const r = await fetch('/api/game?code=' + encodeURIComponent(c) + '&view=screen');
+      const d = await r.json();
+      if (!r.ok) throw Error(d.error || 'No encontramos la sala.');
+      location.href = '/screen/' + c;
+    } catch (err) {
+      notice(err.message);
+      btn.disabled = false;
+    }
+  };
+}
+
+function avatarPickerHtml() {
+  return `<div class="avatar-picker" role="radiogroup" aria-label="Elige tu avatar">
+    ${AVATARS.map(
+      av =>
+        `<button type="button" class="avatar-btn ${selectedAvatar === av ? 'selected' : ''}" data-avatar="${av}" aria-pressed="${
+          selectedAvatar === av
+        }">${av}</button>`
+    ).join('')}
+  </div>`;
+}
+
+function bindAvatarPicker() {
+  document.querySelectorAll('[data-avatar]').forEach(btn => {
+    btn.onclick = () => {
+      selectedAvatar = btn.dataset.avatar;
+      localStorage.setItem('qsd-avatar', selectedAvatar);
+      document.querySelectorAll('[data-avatar]').forEach(b => {
+        b.classList.toggle('selected', b.dataset.avatar === selectedAvatar);
+        b.setAttribute('aria-pressed', b.dataset.avatar === selectedAvatar);
+      });
+    };
+  });
+}
+
+function playerEntry() {
+  app.className = 'entry';
+  app.innerHTML =
+    header() +
+    `<form id="join-code" class="join-card">
+      <h2>Jugador</h2>
+      <label>PIN de sala
+        <input class="pin-input" name="code" maxlength="6" minlength="6" inputmode="numeric" placeholder="123456" required autocomplete="off" autocapitalize="characters">
+      </label>
+      <label>Tu nombre
+        <input name="name" maxlength="30" placeholder="¿Cómo te llamas?" required autocomplete="nickname">
+      </label>
+      <label>Tu avatar</label>
+      ${avatarPickerHtml()}
+      <button class="primary">Entrar a jugar <span aria-hidden="true">→</span></button>
+    </form>
+    <a class="admin-entry" href="/">← Inicio</a>`;
+  bindAvatarPicker();
+  $('#join-code').onsubmit = async e => {
+    e.preventDefault();
+    const f = e.target,
+      btn = f.querySelector('button[type="submit"], button.primary'),
+      c = f.elements.code.value.trim().toUpperCase();
+    if (!/^(?:[0-9]{6}|[A-Z2-9]{6})$/.test(c)) return notice('Revisa el PIN de seis caracteres.');
+    btn.disabled = true;
+    try {
+      const saved = localStorage.getItem('qsd-v2-player-' + c);
+      if (!saved) {
+        const d = await request({ op: 'join', code: c, name: f.elements.name.value, avatar: selectedAvatar });
+        localStorage.setItem('qsd-v2-player-' + c, d.playerToken);
+      }
+      location.href = '/j/' + c;
+    } catch (err) {
+      notice(err.message);
+      btn.disabled = false;
+    }
+  };
+}
+
+function recentRooms() {
+  let rooms = [];
+  try {
+    rooms = JSON.parse(localStorage.getItem('qsd-rooms') || '[]');
+  } catch {}
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (key.startsWith('qsd-v2-host-')) {
+      const c = key.slice(12);
+      if (!rooms.some(r => r.code === c)) rooms.push({ code: c, title: 'Sala ' + c });
+    }
+  }
+  return rooms.filter(r => /^(?:[0-9]{6}|[A-Z2-9]{6})$/.test(r.code)).slice(0, 20);
+}
+
+async function admin() {
+  app.className = 'admin';
+  app.innerHTML = header() + '<p>Abriendo tus salas…</p>';
+  try {
+    const session = await request({ op: 'admin-status' });
+    const rooms = recentRooms();
+    app.innerHTML =
+      header() +
+      `<h1>${session.authenticated ? 'Panel de Organización Deluxe' : 'Acceso de administrador'}</h1>
+      ${
+        session.authenticated
+          ? `<form id="create">
+              <h2>Crear nueva sala</h2>
+              <label>Nombre de la actividad
+                <input name="title" maxlength="80" placeholder="Gran Noche de Películas" required>
+              </label>
+              <label>Plantilla inicial de preguntas
+                <select name="template">
+                  <option value="demo">🎬 Pack Demo con Video Integrado (2 rondas)</option>
+                  <option value="cine">🍿 Pack Momentos Inesperados del Cine (4 rondas)</option>
+                  <option value="bloopers">😂 Pack Bloopers y Videos Virales (3 rondas)</option>
+                  <option value="">✨ Sala en blanco (añadir preguntas manualmente)</option>
+                </select>
+              </label>
+              <div class="checkbox-row">
+                <label><input type="checkbox" name="speedBonus" checked> ⚡ Bono por rapidez (hasta +300 pts)</label>
+                <label><input type="checkbox" name="streakBonus" checked> 🔥 Bono por racha de aciertos</label>
+              </div>
+              <button class="primary">Crear sala Deluxe →</button>
+            </form>
+            <div class="row">
+              <button id="logout" class="quiet">Cerrar sesión</button>
+              <a class="back-link" href="/">← Volver al inicio</a>
+            </div>`
+          : `<form id="login">
+              <label>Clave de administrador (HOST_KEY)
+                <input name="key" type="password" autocomplete="current-password" placeholder="Clave por defecto: deluxe" required>
+              </label>
+              <button class="primary">Entrar</button>
+              <p class="form-hint">Clave predeterminada: <code>deluxe</code> (o tu variable <code>HOST_KEY</code> en Vercel). Recordaremos tu sesión 30 días.</p>
+            </form>`
+      }
+      ${
+        rooms.length
+          ? `<h2>Mis salas recientes</h2>
+            <div class="room-list">
+              ${rooms
+                .map(
+                  r =>
+                    `<a class="room-link" href="/host/${esc(r.code)}">
+                      <span>🎬 ${esc(r.title)}</span>
+                      <strong>PIN ${esc(r.code)} →</strong>
+                    </a>`
+                )
+                .join('')}
+            </div>`
+          : ''
+      }`;
+    bindHeaderTools();
+    if ($('#login'))
+      $('#login').onsubmit = async e => {
+        e.preventDefault();
+        const btn = e.target.querySelector('button');
+        btn.disabled = true;
+        try {
+          await request({ op: 'login', key: e.target.elements.key.value });
+          admin();
+        } catch (err) {
+          notice(err.message);
+          btn.disabled = false;
+        }
+      };
+    if ($('#create'))
+      $('#create').onsubmit = async e => {
+        e.preventDefault();
+        const f = e.target;
+        const btn = f.querySelector('button');
+        btn.disabled = true;
+        try {
+          const title = f.elements.title.value,
+            template = f.elements.template.value,
+            speedBonus = f.elements.speedBonus.checked,
+            streakBonus = f.elements.streakBonus.checked,
+            d = await request({ op: 'create', title, template, speedBonus, streakBonus });
+          localStorage.setItem('qsd-v2-host-' + d.code, d.hostToken);
+          localStorage.setItem('qsd-rooms', JSON.stringify([{ code: d.code, title }, ...rooms].slice(0, 20)));
+          location.href = '/host/' + d.code;
+        } catch (err) {
+          notice(err.message);
+          btn.disabled = false;
+        }
+      };
+    if ($('#logout'))
+      $('#logout').onclick = async () => {
+        try {
+          await request({ op: 'logout' });
+          for (const r of recentRooms()) localStorage.removeItem('qsd-v2-host-' + r.code);
+          admin();
+        } catch (err) {
+          notice(err.message);
+        }
+      };
+  } catch (err) {
+    app.innerHTML = header() + `<h1>No pudimos abrir tus salas</h1><p>${esc(err.message)}</p><button id="retry">Reintentar</button>`;
+    $('#retry').onclick = admin;
+  }
+}
+
+function join() {
+  app.className = 'entry';
+  app.innerHTML =
+    header() +
+    `<div class="welcome"><p>PIN de sala <strong>${esc(code)}</strong></p></div>
+    <form id="join" class="join-card">
+      <label>Tu nombre
+        <input name="name" maxlength="30" placeholder="¿Cómo te llamas?" required autocomplete="nickname">
+      </label>
+      <label>Elige tu avatar</label>
+      ${avatarPickerHtml()}
+      <button class="primary">Entrar a la partida</button>
+    </form>`;
+  bindAvatarPicker();
+  $('#join').onsubmit = async e => {
+    e.preventDefault();
+    const btn = e.target.querySelector('button.primary');
+    btn.disabled = true;
+    try {
+      const d = await request({ op: 'join', name: e.target.elements.name.value, avatar: selectedAvatar });
+      secret = d.playerToken;
+      localStorage.setItem(storageKey, secret);
+      poll();
+    } catch (err) {
+      notice(err.message);
+      btn.disabled = false;
+    }
+  };
+}
+
+function podiumHtml(list = []) {
+  if (!list.length) return '<p class="muted">Aún no hay puntajes registrados.</p>';
+  const top3 = list.slice(0, 3);
+  const medals = ['🥇', '🥈', '🥉'];
+  return `<div class="podium-grid">
+    ${top3
+      .map(
+        (p, idx) => `<div class="podium-spot podium-${idx + 1}">
+        <div class="podium-medal">${medals[idx] || '🏅'}</div>
+        <div class="podium-avatar">${esc(p.avatar || '🎬')}</div>
+        <div class="podium-name">${esc(p.name)}</div>
+        <div class="podium-score">${p.score.toLocaleString('es-CL')} pts</div>
+        ${p.streak >= 2 ? `<span class="streak-pill">🔥 Racha x${p.streak}</span>` : ''}
+      </div>`
+      )
+      .join('')}
+  </div>`;
+}
+
+const ranking = () => {
+  const list = state.ranking || [];
+  return `<section class="ranking-section">
+    <h2>${state.phase === 'finished' ? '🏆 Gran Podio Final' : '📊 Tabla de Posiciones'}</h2>
+    ${podiumHtml(list)}
+    <div class="rank-list">
+      ${list
+        .map(
+          p =>
+            `<div class="rank">
+              <span><strong>#${p.rank}</strong> ${esc(p.avatar || '🎬')} ${esc(p.name)} ${
+              p.streak >= 2 ? `<small class="streak-pill">🔥 x${p.streak}</small>` : ''
+            }</span>
+              <strong>${p.score.toLocaleString('es-CL')} pts</strong>
+            </div>`
+        )
+        .join('')}
+    </div>
+  </section>`;
+};
+
+const options = () => {
+  const showStats = state.stats && ['results', 'ranking', 'finished'].includes(state.phase);
+  return `<div class="options">
+    ${(state.round?.options || [])
+      .map((o, i) => {
+        const pct = showStats ? state.stats.percents[i] || 0 : null;
+        const count = showStats ? state.stats.counts[i] || 0 : null;
+        const isCorrect = state.round.correct === i;
+        return `<div class="option card choice-${i} ${isCorrect ? 'correct' : ''}">
+          <b>${letters[i]}</b>
+          <div class="option-body">
+            <div class="option-text-row">
+              <span>${esc(o)}${isCorrect ? ' ✓' : ''}</span>
+              ${showStats ? `<small class="vote-stat">${pct}% (${count})</small>` : ''}
+            </div>
+            ${
+              showStats
+                ? `<div class="vote-bar-track"><div class="vote-bar-fill" style="width:${pct}%"></div></div>`
+                : ''
+            }
+          </div>
+        </div>`;
+      })
+      .join('')}
+  </div>`;
+};
+
+function videoStageHtml(s) {
+  if (!s.round?.videoUrl) return '';
+  const isIntro = s.phase === 'watching';
+  const isReveal = s.phase === 'closed' || s.phase === 'results';
+  if (!isIntro && !isReveal) return '';
+  return `<div class="video-stage card">
+    <div class="video-badge">${isIntro ? '🎬 Escena en curso · Atención al corte' : '🍿 Desenlace de la escena'}</div>
+    <video id="round-video" src="${esc(s.round.videoUrl)}" playsinline preload="auto" controls></video>
+  </div>`;
+}
+
+function syncRoundVideo() {
+  const video = $('#round-video');
+  if (!video || !state?.round?.videoUrl) return;
+  const q = state.round;
+  const cut = Number.isFinite(q.cutTime) ? q.cutTime : null;
+  const end = Number.isFinite(q.endTime) ? q.endTime : null;
+  const modeKey = `${q.id}-${state.phase}`;
+  if (video.dataset.modeKey === modeKey) return;
+  video.dataset.modeKey = modeKey;
+
+  if (state.phase === 'watching') {
+    video.currentTime = 0;
+    video.ontimeupdate = () => {
+      if (cut && video.currentTime >= cut) {
+        video.pause();
+        video.ontimeupdate = null;
+      }
+    };
+    video.play().catch(() => {});
+  } else if (state.phase === 'closed' || state.phase === 'results') {
+    if (cut) video.currentTime = Math.max(0, cut - 0.15);
+    video.ontimeupdate = () => {
+      if (end && video.currentTime >= end) {
+        video.pause();
+        video.ontimeupdate = null;
+      }
+    };
+    if (state.phase === 'closed') video.play().catch(() => {});
+  }
+}
+
+function timerBarHtml() {
+  return `<div class="timer-wrap">
+    <p class="timer" aria-label="Tiempo restante"></p>
+    <div class="timer-progress-track"><div class="timer-progress-bar"></div></div>
+  </div>`;
+}
+
+function roundBadgesHtml(s) {
+  if (!s.round) return '';
+  return `<div class="round-badges">
+    <span class="pill">Ronda ${s.index + 1} de ${s.roundCount}</span>
+    ${s.round.category ? `<span class="pill pill-gold">${esc(s.round.category)}</span>` : ''}
+    ${s.round.practice ? `<span class="pill pill-practice">Ensayo · sin puntos</span>` : ''}
+    ${!s.round.practice && s.settings?.speedBonus ? `<span class="pill">⚡ Bono velocidad</span>` : ''}
+  </div>`;
+}
+
+function publicContent() {
+  const s = state;
+  if (s.phase === 'lobby') {
+    const lobbyPlayers = s.lobbyPlayers || [];
+    return `<div class="lobby-hero">
+      <h1>${esc(s.title)}</h1>
+      <p class="muted">Escanea el código QR o entra en <strong>${esc(location.host)}/play</strong></p>
+      <div class="lobby-pin-box">
+        <div>
+          <p class="code-label">PIN DE SALA</p>
+          <p class="code">${esc(code)}</p>
+          <p class="player-counter"><strong>${s.playerCount}</strong> ${
+      s.playerCount === 1 ? 'jugador conectado' : 'jugadores conectados'
+    }</p>
+        </div>
+        ${qr ? `<img class="qr" src="${qr}" alt="QR para ingresar a la partida">` : ''}
+      </div>
+      ${
+        lobbyPlayers.length
+          ? `<div class="player-chips">
+              ${lobbyPlayers.map(p => `<span class="player-chip">${esc(p.avatar)} ${esc(p.name)}</span>`).join('')}
+            </div>`
+          : '<p class="muted">Esperando a que entren los primeros jugadores…</p>'
+      }
+    </div>`;
+  }
+  if (s.phase === 'watching') {
+    return `${roundBadgesHtml(s)}
+      <h1>👀 Mira la escena con atención</h1>
+      <p class="subtitle-lead">Las alternativas se abrirán justo después del corte.</p>
+      ${videoStageHtml(s)}`;
+  }
+  if (s.phase === 'open') {
+    return `${roundBadgesHtml(s)}
+      <h1>${esc(s.round.question)}</h1>
+      ${timerBarHtml()}
+      ${options()}
+      <p class="muted"><strong>${s.received}</strong> de ${s.playerCount} respuestas recibidas</p>`;
+  }
+  if (s.phase === 'closed') {
+    return `${roundBadgesHtml(s)}
+      <h1>${esc(s.round.question)}</h1>
+      ${videoStageHtml(s)}
+      ${options()}
+      <p class="subtitle-lead">🔒 Respuestas cerradas · Mira qué sucede después en la escena.</p>`;
+  }
+  if (s.phase === 'results') {
+    return `${roundBadgesHtml(s)}
+      <h1>${esc(s.round.question)}</h1>
+      ${videoStageHtml(s)}
+      ${options()}
+      <section class="correct-banner">
+        <h2 class="success">✓ Respuesta correcta: ${letters[s.round.correct]} · ${esc(s.round.options[s.round.correct])}</h2>
+        ${
+          s.stats
+            ? `<p class="muted">${s.stats.correctCount} de ${s.stats.total} respuestas acertaron (${
+                s.stats.percents[s.round.correct] || 0
+              }%)</p>`
+            : ''
+        }
+        ${s.round.practice ? '<p>Ronda de ensayo · sin puntos</p>' : ''}
+      </section>`;
+  }
+  return ranking();
+}
+
+function reactionBarHtml() {
+  return `<div class="reaction-bar" aria-label="Enviar reacción a la pantalla">
+    ${EMOJIS.map(em => `<button type="button" class="rx-btn" data-react="${em}">${em}</button>`).join('')}
+  </div>`;
+}
+
+function bindReactions() {
+  document.querySelectorAll('[data-react]').forEach(btn => {
+    btn.onclick = () => {
+      sfx.click();
+      request({ op: 'react', emoji: btn.dataset.react }).catch(() => {});
+    };
+  });
+}
+
+function player() {
+  const s = state,
+    p = s.me;
+  if (!p) {
+    notice('Vuelve a ingresar como jugador.');
+    secret = '';
+    localStorage.removeItem(storageKey);
+    join();
+    return;
+  }
+  let content = publicContent();
+  if (s.phase === 'open') {
+    if (p.eligible > s.index) {
+      content = '<h1>Ya estás dentro</h1><p>Participarás desde la próxima ronda.</p>';
+    } else if (p.answered) {
+      content = `${roundBadgesHtml(s)}
+        <h1>${esc(s.round.question)}</h1>
+        ${options()}
+        <section class="confirmed-box">
+          <h2>✓ Respuesta confirmada</h2>
+          <p>Elegiste <strong>${letters[p.choice]} · ${esc(s.round.options[p.choice])}</strong></p>
+          <p class="muted">Mira la pantalla principal para ver el desenlace.</p>
+        </section>`;
+    } else {
+      content = `${roundBadgesHtml(s)}
+        <h1>${esc(s.round.question)}</h1>
+        ${timerBarHtml()}
+        <div class="options">
+          ${s.round.options
+            .map(
+              (o, i) =>
+                `<button class="option choice-${i} ${selection === i ? 'selected' : ''}" data-choice="${i}" aria-pressed="${
+                  selection === i
+                }" data-live>
+                  <b>${letters[i]}</b>
+                  <span>${esc(o)}</span>
+                </button>`
+            )
+            .join('')}
+        </div>
+        <p><button id="confirm" class="primary" data-live>${
+          selection === null ? 'Selecciona una alternativa' : 'Confirmar alternativa ' + letters[selection] + ' →'
+        }</button></p>
+        <small class="muted">Puedes cambiar tu selección antes de confirmar.</small>`;
+    }
+  }
+  if (s.phase === 'results' && p.result) {
+    const r = p.result;
+    content += `<section class="personal-result ${r.correct ? 'win' : 'lose'}">
+      <h2>${r.correct ? '🎉 ¡Acertaste!' : '😅 Esta vez no acertaste'}</h2>
+      <p class="points-earned">+${(r.points || 0).toLocaleString('es-CL')} puntos</p>
+      ${
+        r.speedBonus || r.streakBonus
+          ? `<p class="bonus-breakdown">Base: ${r.base || 0} ${r.speedBonus ? `· ⚡ Rapidez +${r.speedBonus}` : ''} ${
+              r.streakBonus ? `· 🔥 Racha +${r.streakBonus}` : ''
+            }</p>`
+          : ''
+      }
+      ${p.score !== undefined ? `<p class="muted">Puntaje total: <strong>${p.score.toLocaleString('es-CL')} pts</strong> ${p.rank ? `(Puesto #${p.rank})` : ''}</p>` : ''}
+    </section>`;
+  }
+  app.innerHTML =
+    header() +
+    `<div class="player-bar">
+      <span>${esc(p.avatar || '🎬')} <strong>${esc(p.name)}</strong></span>
+      ${p.streak >= 2 ? `<span class="streak-pill">🔥 Racha x${p.streak}</span>` : ''}
+      ${p.score !== undefined ? `<span><strong>${p.score.toLocaleString('es-CL')} pts</strong></span>` : ''}
+    </div>` +
+    content +
+    reactionBarHtml();
+
+  document.querySelectorAll('[data-choice]').forEach(btn => {
+    btn.onclick = () => {
+      sfx.click();
+      selection = Number(btn.dataset.choice);
+      player();
+      status();
+    };
+  });
+  if ($('#confirm')) {
+    $('#confirm').onclick = () => {
+      if (selection === null) return notice('Selecciona una alternativa.');
+      sfx.click();
+      mutate({ op: 'answer', roundId: s.round.id, choice: selection });
+    };
+  }
+  bindReactions();
+}
+
+const help = `<details>
+  <summary>📖 Guía rápida para conducir la partida (Zoom / OBS / Proyector)</summary>
+  <ol>
+    <li><strong>Prepara las preguntas:</strong> Carga uno de los packs precargados o añade tus propias preguntas con opción de video integrado (URL MP4 + segundo de corte).</li>
+    <li><strong>Video integrado o Reproductor externo:</strong> Si defines un enlace de video (ej. <code>/demo.mp4</code> y corte en <code>2.2</code> s), la Pantalla Gigante reproducirá el clip y se pausará sola en el corte. También puedes usar VLC/OBS en tu PC si usas películas locales.</li>
+    <li><strong>Control de tiempos:</strong> Pulsa <em>Abrir respuestas</em> cuando todos hayan visto el corte. Al cerrar, muestra el desenlace del video y luego revela los resultados con gráficos de votación.</li>
+  </ol>
+</details>`;
+
+function host() {
+  app.className = 'admin host';
+  const s = state;
+  if (!s.rounds) {
+    app.innerHTML =
+      header() +
+      '<h1>Acceso del organizador</h1><p>Entra para administrar esta sala.</p><a class="button-link" href="/admin.html">Entrar como organizador →</a>';
+    return;
+  }
+  const action = {
+    lobby: ['prepare', '🎬 Preparar primera ronda'],
+    watching: ['open', '🔓 Abrir respuestas'],
+    open: ['close', '🔒 Cerrar respuestas ahora'],
+    closed: ['results', '✨ Mostrar resultados y estadísticas'],
+    results: ['ranking', '🏆 Mostrar ranking y podio'],
+    ranking: s.index + 1 < s.roundCount ? ['prepare', '🎬 Preparar siguiente ronda'] : ['finish', '🎉 Finalizar partida']
+  }[s.phase];
+
+  const editingRound = editingRoundId ? s.rounds.find(r => r.id === editingRoundId) : null;
+
+  app.innerHTML =
+    header() +
+    `<div class="row host-top-links">
+      <a href="/admin.html" class="back-link">← Mis salas</a>
+      ${
+        s.phase !== 'lobby'
+          ? `<button type="button" id="reset-game" class="quiet">↺ Reiniciar partida al lobby</button>`
+          : ''
+      }
+    </div>
+    <h1>${esc(s.title)}</h1>
+    <div class="host-pin">
+      <div>
+        <span class="code-label">COMPARTE ESTE PIN</span>
+        <p class="code">${esc(code)}</p>
+        <span>${s.playerCount} jugadores en la sala</span>
+      </div>
+      ${qr ? `<img class="qr" src="${qr}" alt="QR para ingresar a esta sala">` : ''}
+    </div>
+    <nav>
+      <a href="/screen/${code}" target="_blank" rel="noopener">▣ Pantalla gigante ↗</a>
+      <a href="/j/${code}" target="_blank" rel="noopener">▯ Vista Jugador ↗</a>
+      <button type="button" id="copy">📋 Copiar enlace de invitación</button>
+    </nav>
+    <section class="director-panel">
+      <div class="row">
+        <strong>🎛️ Control en vivo</strong>
+        <span class="pill">${s.playerCount} jugadores</span>
+        <span class="pill">${s.index < 0 ? 'En espera (Lobby)' : 'Ronda ' + (s.index + 1) + ' de ' + s.roundCount}</span>
+      </div>
+      ${
+        s.round
+          ? `<h2>${esc(s.round.question)}</h2>
+            ${options()}
+            <p class="muted">
+              ${s.round.practice ? 'Ensayo sin puntos' : '1.000 puntos base por acierto'}
+              ${!s.round.practice && s.settings?.speedBonus ? ' · ⚡ Bono rapidez activo' : ''}
+              ${!s.round.practice && s.settings?.streakBonus ? ' · 🔥 Bono racha activo' : ''}
+              ${s.round.videoUrl ? ` · 🎬 Video: ${esc(s.round.videoUrl)} (corte: ${s.round.cutTime ?? '-'}s)` : ''}
+            </p>`
+          : '<p class="muted">Prepara las rondas abajo y pulsa "Preparar primera ronda" para comenzar.</p>'
+      }
+      ${s.phase === 'watching' ? '<p class="director-hint">⏸️ Reproduce el video hasta el corte antes de abrir las respuestas.</p>' : ''}
+      ${s.phase === 'closed' ? '<p class="director-hint">▶️ Reproduce el desenlace del video antes de revelar la respuesta correcta.</p>' : ''}
+      ${s.phase === 'open' ? `${timerBarHtml()}<p><strong>${s.received}</strong> de ${s.playerCount} respuestas recibidas</p>` : ''}
+      ${
+        action
+          ? `<button id="action" class="primary" data-live ${!s.roundCount ? 'disabled' : ''}>${action[1]}</button>`
+          : ''
+      }
+    </section>
+
+    ${
+      s.phase === 'lobby'
+        ? `<section class="Templates-bar">
+            <h2>📦 Banco de preguntas y plantillas rápidas</h2>
+            <div class="row">
+              <button type="button" data-pack="demo">🎬 + Pack Demo con Video</button>
+              <button type="button" data-pack="cine">🍿 + Pack Cine (4)</button>
+              <button type="button" data-pack="bloopers">😂 + Pack Virales (3)</button>
+              <button type="button" id="practice">🧪 + Ronda de ensayo</button>
+              <button type="button" id="export-json" class="quiet">⬇️ Exportar JSON</button>
+            </div>
+            <div class="checkbox-row" style="margin-top:16px">
+              <label><input type="checkbox" id="opt-speed" ${s.settings?.speedBonus ? 'checked' : ''}> ⚡ Bono por rapidez (+300 máx)</label>
+              <label><input type="checkbox" id="opt-streak" ${s.settings?.streakBonus ? 'checked' : ''}> 🔥 Bono por racha consecutiva</label>
+            </div>
+          </section>
+
+          <details id="editor" ${editingRound ? 'open' : ''}>
+            <summary>${editingRound ? '✏️ Editando pregunta' : '➕ Añadir o editar pregunta personalizada'}</summary>
+            <form id="round">
+              <label>Pregunta
+                <input name="question" maxlength="180" required value="${esc(editingRound?.question || '')}" placeholder="¿Qué sucede justo después de que se abre la puerta?">
+              </label>
+              ${letters
+                .map(
+                  (l, i) =>
+                    `<label>Alternativa ${l}
+                      <input name="option${i}" maxlength="80" required value="${esc(editingRound?.options?.[i] || '')}">
+                    </label>`
+                )
+                .join('')}
+              <label>Respuesta Correcta
+                <select name="correct">
+                  ${letters
+                    .map(
+                      (l, i) =>
+                        `<option value="${i}" ${editingRound?.correct === i ? 'selected' : ''}>Alternativa ${l}</option>`
+                    )
+                    .join('')}
+                </select>
+              </label>
+              <label>Segundos para responder (10–120)
+                <input type="number" min="10" max="120" value="${editingRound?.seconds || 25}" name="seconds" required>
+              </label>
+              <label>Categoría o etiqueta (opcional)
+                <input name="category" maxlength="40" value="${esc(editingRound?.category || '')}" placeholder="Ej: Clásicos, Acción, Humor">
+              </label>
+              <label>URL de Video MP4 (opcional, ej: <code>/demo.mp4</code>)
+                <input name="videoUrl" maxlength="300" value="${esc(editingRound?.videoUrl || '')}" placeholder="/demo.mp4 o https://...">
+              </label>
+              <label>Segundo de corte automático (opcional, ej: <code>2.2</code>)
+                <input type="number" step="0.1" min="0" name="cutTime" value="${editingRound?.cutTime ?? ''}" placeholder="2.2">
+              </label>
+              <label>Segundo final del desenlace (opcional, ej: <code>5.0</code>)
+                <input type="number" step="0.1" min="0" name="endTime" value="${editingRound?.endTime ?? ''}" placeholder="5.0">
+              </label>
+              <label><input type="checkbox" name="practice" ${editingRound?.practice ? 'checked' : ''}> Ronda de ensayo (sin puntos)</label>
+              <div class="row" style="grid-column:1/-1">
+                <button class="primary">${editingRound ? 'Guardar cambios' : 'Guardar pregunta'}</button>
+                ${editingRound ? '<button type="button" id="cancel-edit" class="quiet">Cancelar edición</button>' : ''}
+              </div>
+            </form>
+          </details>
+
+          <h2>Preguntas preparadas (${s.roundCount})</h2>
+          <div class="rounds-list">
+            ${s.rounds
+              .map(
+                (q, i) =>
+                  `<div class="rank round-item">
+                    <div>
+                      <strong>${i + 1}. ${esc(q.question)}</strong>
+                      <div class="muted small-meta">
+                        ✓ ${letters[q.correct]}: ${esc(q.options[q.correct])} · ⏱️ ${q.seconds}s
+                        ${q.practice ? ' · 🧪 Ensayo' : ''}
+                        ${q.category ? ` · 🏷️ ${esc(q.category)}` : ''}
+                        ${q.videoUrl ? ` · 🎬 Video (${q.cutTime ?? 0}s)` : ''}
+                      </div>
+                    </div>
+                    <div class="round-actions">
+                      <button type="button" data-move="up" data-id="${q.id}" ${i === 0 ? 'disabled' : ''} title="Subir">↑</button>
+                      <button type="button" data-move="down" data-id="${q.id}" ${
+                    i === s.rounds.length - 1 ? 'disabled' : ''
+                  } title="Bajar">↓</button>
+                      <button type="button" data-edit="${q.id}">Editar</button>
+                      <button type="button" data-delete="${q.id}">Eliminar</button>
+                    </div>
+                  </div>`
+              )
+              .join('')}
+          </div>`
+        : ''
+    }
+
+    ${['results', 'ranking', 'finished'].includes(s.phase) ? ranking() : ''}
+
+    <details open>
+      <summary>👥 Jugadores en la sala (${s.playerCount})</summary>
+      ${
+        s.players.length
+          ? `<div class="host-players-grid">
+              ${s.players
+                .map(
+                  p =>
+                    `<div class="host-player-card">
+                      <span>${esc(p.avatar || '🎬')} <strong>${esc(p.name)}</strong> (${p.score} pts) ${
+                      p.answered ? '✅' : ''
+                    }</span>
+                      <button type="button" class="kick-btn" data-kick="${esc(p.id)}" title="Quitar de la sala">✕</button>
+                    </div>`
+                )
+                .join('')}
+            </div>`
+          : '<p class="muted">Aún no hay jugadores conectados.</p>'
+      }
+    </details>
+    ${help}`;
+
+  $('#copy').onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(location.origin + '/j/' + code);
+      notice('Enlace de invitación copiado al portapapeles.');
+    } catch {
+      notice(location.origin + '/j/' + code);
+    }
+  };
+  if ($('#action'))
+    $('#action').onclick = () => {
+      sfx.click();
+      mutate({ op: 'action', action: action[0], expectedPhase: s.phase, expectedIndex: s.index });
+    };
+  if ($('#reset-game'))
+    $('#reset-game').onclick = () => {
+      if (confirm('¿Reiniciar la partida al lobby y poner los puntajes en cero?')) {
+        mutate({ op: 'reset' });
+      }
+    };
+  if ($('#round'))
+    $('#round').onsubmit = async e => {
+      e.preventDefault();
+      const f = e.target;
+      const payload = {
+        op: editingRoundId ? 'edit-round' : 'round',
+        id: editingRoundId || undefined,
+        question: f.elements.question.value,
+        options: letters.map((_, i) => f.elements['option' + i].value),
+        correct: Number(f.elements.correct.value),
+        seconds: Number(f.elements.seconds.value),
+        practice: f.elements.practice.checked,
+        category: f.elements.category.value,
+        videoUrl: f.elements.videoUrl.value,
+        cutTime: f.elements.cutTime.value !== '' ? Number(f.elements.cutTime.value) : null,
+        endTime: f.elements.endTime.value !== '' ? Number(f.elements.endTime.value) : null
+      };
+      editingRoundId = null;
+      await mutate(payload);
+    };
+  if ($('#cancel-edit'))
+    $('#cancel-edit').onclick = () => {
+      editingRoundId = null;
+      host();
+      status();
+    };
+  if ($('#practice'))
+    $('#practice').onclick = () =>
+      mutate({
+        op: 'round',
+        question: 'Ensayo: selecciona la alternativa A.',
+        options: ['Esta es la respuesta', 'Alternativa B', 'Alternativa C', 'Alternativa D'],
+        correct: 0,
+        seconds: 25,
+        practice: true,
+        category: 'Ensayo'
+      });
+  document.querySelectorAll('[data-pack]').forEach(btn => {
+    btn.onclick = () => mutate({ op: 'template', pack: btn.dataset.pack });
+  });
+  if ($('#export-json')) {
+    $('#export-json').onclick = () => {
+      const blob = new Blob([JSON.stringify(s.rounds, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `preguntas-${code}.json`;
+      a.click();
+    };
+  }
+  const bindSettings = () => {
+    const speedEl = $('#opt-speed'),
+      streakEl = $('#opt-streak');
+    if (speedEl && streakEl) {
+      const save = () => mutate({ op: 'settings', speedBonus: speedEl.checked, streakBonus: streakEl.checked });
+      speedEl.onchange = save;
+      streakEl.onchange = save;
+    }
+  };
+  bindSettings();
+  document.querySelectorAll('[data-delete]').forEach(btn => {
+    btn.onclick = () => mutate({ op: 'delete', id: btn.dataset.delete });
+  });
+  document.querySelectorAll('[data-edit]').forEach(btn => {
+    btn.onclick = () => {
+      editingRoundId = btn.dataset.edit;
+      host();
+      status();
+    };
+  });
+  document.querySelectorAll('[data-move]').forEach(btn => {
+    btn.onclick = () => mutate({ op: 'move-round', id: btn.dataset.id, dir: btn.dataset.move });
+  });
+  document.querySelectorAll('[data-kick]').forEach(btn => {
+    btn.onclick = () => mutate({ op: 'kick', playerId: btn.dataset.kick });
+  });
+}
+
+async function mutate(body) {
+  if (busy || !online) return;
+  busy = true;
+  status();
+  try {
+    await request(body);
+    viewKey = '';
+    await refresh(true);
+  } catch (e) {
+    notice(e.message);
+  } finally {
+    busy = false;
+    status();
+  }
+}
+
+function handlePhaseEffects(s) {
+  if (!s) return;
+  if (s.phase !== lastPhase) {
+    if (lastPhase !== '') {
+      if (s.phase === 'open') sfx.open();
+      else if (s.phase === 'closed') sfx.close();
+      else if (s.phase === 'results') {
+        sfx.reveal();
+        if (role === 'screen' || (role === 'player' && s.me?.result?.correct)) launchConfetti();
+      } else if (s.phase === 'ranking' || s.phase === 'finished') {
+        sfx.podium();
+        if (s.phase === 'finished') launchConfetti();
+      }
+    }
+    lastPhase = s.phase;
+  }
+  if (s.reactions) spawnReactions(s.reactions);
+}
+
+function render() {
+  if (role === 'host') host();
+  else if (role === 'player') player();
+  else {
+    app.className = 'screen';
+    app.innerHTML = header() + publicContent();
+  }
+  syncRoundVideo();
+  status();
+}
+
+async function refresh(force = false) {
+  const started = Date.now(),
+    s = await request();
+  offset = s.serverNow - (started + Date.now()) / 2;
+  online = true;
+  state = s;
+  if (s.round?.id !== lastRound) {
+    lastRound = s.round?.id;
+    selection = null;
+  }
+  handlePhaseEffects(s);
+  const key = JSON.stringify({ ...s, serverNow: 0, reactions: [] });
+  const editing = role === 'host' && $('#editor')?.open;
+  if ((key !== viewKey && !editing) || force) {
+    viewKey = key;
+    render();
+  }
+  status();
+}
+
+let polling = false;
+async function poll() {
+  if (polling) return;
+  polling = true;
+  try {
+    await refresh();
+  } catch (e) {
+    online = false;
+    status();
+    notice(e.message);
+    if (!state)
+      app.innerHTML = header() + `<h1>No pudimos conectar</h1><p>${esc(e.message)}</p><p>Volveremos a intentarlo automáticamente.</p>`;
+  } finally {
+    polling = false;
+    setTimeout(poll, 2200);
+  }
+}
+
+setInterval(() => {
+  const el = $('.timer');
+  const bar = $('.timer-progress-bar');
+  if (el && state?.deadline) {
+    const remainingMs = Math.max(0, state.deadline - Date.now() - offset);
+    const left = Math.ceil(remainingMs / 1000);
+    el.textContent = left + ' s';
+    el.classList.toggle('urgent', left <= 5);
+    if (bar && state.round?.seconds) {
+      const pct = Math.max(0, Math.min(100, (remainingMs / (state.round.seconds * 1000)) * 100));
+      bar.style.width = pct + '%';
+      bar.classList.toggle('urgent', left <= 5);
+    }
+    if (left !== lastTickSecond && left > 0 && left <= 10) {
+      lastTickSecond = left;
+      sfx.tick(left <= 5);
+    }
+    if (left === 0) {
+      document.querySelectorAll('[data-choice],#confirm').forEach(x => (x.disabled = true));
+    }
+  }
+}, 200);
+
+if (role === 'home') home();
+else if (role === 'entry') playerEntry();
+else if (role === 'tv') tvEntry();
+else if (role === 'admin') admin();
+else if (role === 'player' && !secret) join();
+else {
+  app.innerHTML = header() + '<p>Conectando…</p>';
+  poll();
+}
+
+if (role === 'screen' || role === 'host') {
+  request({ op: 'qr', origin: location.origin })
+    .then(d => {
+      qr = d.image;
+      viewKey = '';
+    })
+    .catch(() => {});
+}
