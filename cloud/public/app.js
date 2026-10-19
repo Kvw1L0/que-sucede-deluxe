@@ -38,6 +38,7 @@ let secret = localStorage.getItem(storageKey) || '',
   lastTickSecond = -1,
   editingRoundId = null,
   lastVideoSeq = -1,
+  tvAudioUnlocked = false,
   localTvVideos = {}; // map of filename -> Blob URL loaded automatically from IndexedDB
 
 const seenReactions = new Set();
@@ -46,7 +47,7 @@ const seenReactions = new Set();
 function openVideoDb() {
   return new Promise((resolve, reject) => {
     if (typeof indexedDB === 'undefined') return reject(new Error('No IndexedDB'));
-    const req = indexedDB.open('qsd-local-videos-db', 1);
+    const req = indexedDB.open('qsd-local-videos-db', 2);
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains('videos')) {
@@ -58,21 +59,52 @@ function openVideoDb() {
   });
 }
 
+function registerLocalBlob(name, blob) {
+  if (!name || !blob) return '';
+  const cleanName = String(name).replace(/^local:/i, '').trim();
+  const lowerName = cleanName.toLowerCase();
+  const blobUrl = URL.createObjectURL(blob);
+  localTvVideos[cleanName] = blobUrl;
+  localTvVideos['local:' + cleanName] = blobUrl;
+  localTvVideos[lowerName] = blobUrl;
+  localTvVideos['local:' + lowerName] = blobUrl;
+  localTvVideos.__latest = blobUrl;
+  return blobUrl;
+}
+
 async function saveLocalVideoToIdb(file) {
+  if (!file) return false;
+  const cleanName = String(file.name || 'video.mp4').replace(/^local:/i, '').trim();
+  const mime = file.type || 'video/mp4';
+  registerLocalBlob(cleanName, file);
   try {
+    const buffer = await file.arrayBuffer();
     const db = await openVideoDb();
     await new Promise((resolve, reject) => {
       const tx = db.transaction('videos', 'readwrite');
-      tx.objectStore('videos').put({ name: file.name, file, updatedAt: Date.now() });
+      tx.objectStore('videos').put({
+        name: cleanName,
+        mime,
+        buffer,
+        updatedAt: Date.now()
+      });
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
-    const blobUrl = URL.createObjectURL(file);
-    localTvVideos[file.name] = blobUrl;
-    localTvVideos['local:' + file.name] = blobUrl;
     return true;
   } catch {
-    return false;
+    try {
+      const db = await openVideoDb();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction('videos', 'readwrite');
+        tx.objectStore('videos').put({ name: cleanName, file, mime, updatedAt: Date.now() });
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
 }
 
@@ -85,17 +117,23 @@ async function loadLocalVideosFromIdb() {
       req.onsuccess = () => resolve(req.result || []);
       req.onerror = () => reject(req.error);
     });
+    items.sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0));
     for (const item of items) {
-      if (item?.name && item?.file && !localTvVideos[item.name]) {
-        const blobUrl = URL.createObjectURL(item.file);
-        localTvVideos[item.name] = blobUrl;
-        localTvVideos['local:' + item.name] = blobUrl;
+      if (!item?.name) continue;
+      const cleanName = String(item.name).replace(/^local:/i, '').trim();
+      if (localTvVideos[cleanName]) continue;
+      let blob = null;
+      if (item.buffer instanceof ArrayBuffer) {
+        blob = new Blob([item.buffer], { type: item.mime || 'video/mp4' });
+      } else if (item.file instanceof Blob) {
+        blob = item.file;
       }
+      if (blob) registerLocalBlob(cleanName, blob);
     }
   } catch {}
 }
 
-loadLocalVideosFromIdb().then(() => {
+const idbReadyPromise = loadLocalVideosFromIdb().then(() => {
   if (role === 'screen' && state) {
     viewKey = '';
     render();
@@ -109,12 +147,18 @@ if (bc) {
     const msg = e.data;
     if (!msg) return;
     if (msg.type === 'video-cmd' && role === 'screen') {
+      await loadLocalVideosFromIdb();
+      if (state) state.videoState = msg.videoState;
       applyVideoCommand(msg.videoState, true);
     } else if (msg.type === 'local-video-updated' && role === 'screen') {
+      if (msg.file instanceof Blob && msg.name) {
+        registerLocalBlob(msg.name, msg.file);
+      }
       await loadLocalVideosFromIdb();
       viewKey = '';
       render();
     } else if (msg.type === 'refresh') {
+      await loadLocalVideosFromIdb();
       refresh(true).catch(() => {});
     }
   };
@@ -652,17 +696,22 @@ const options = () => {
 
 function resolveVideoSrc(rawUrl) {
   if (!rawUrl) return '';
-  if (localTvVideos[rawUrl]) return localTvVideos[rawUrl];
-  const baseName = rawUrl.replace(/^local:/, '');
+  const trimmed = String(rawUrl).trim();
+  if (localTvVideos[trimmed]) return localTvVideos[trimmed];
+  const baseName = trimmed.replace(/^local:/i, '').trim();
   if (localTvVideos[baseName]) return localTvVideos[baseName];
-  return rawUrl;
+  if (localTvVideos[baseName.toLowerCase()]) return localTvVideos[baseName.toLowerCase()];
+  if (trimmed.toLowerCase().startsWith('local:') && localTvVideos.__latest) {
+    return localTvVideos.__latest;
+  }
+  return trimmed;
 }
 
 function videoStageHtml(s, cleanTv = false) {
   if (!s.round?.videoUrl) return '';
   if (!['watching', 'open', 'closed', 'results'].includes(s.phase)) return '';
   const src = resolveVideoSrc(s.round.videoUrl);
-  const isMissingLocal = src.startsWith('local:');
+  const isMissingLocal = src.toLowerCase().startsWith('local:');
   if (cleanTv) {
     return `<div class="video-stage tv-clean-stage">
       ${
@@ -692,41 +741,91 @@ function videoStageHtml(s, cleanTv = false) {
   </div>`;
 }
 
+function tryPlayVideo(video) {
+  if (!video) return;
+  const playPromise = video.play();
+  if (playPromise && typeof playPromise.catch === 'function') {
+    playPromise.catch(() => {
+      // Browser blocked unmuted autoplay because TV tab had no prior user click:
+      // start playing muted immediately so the video always plays, and unmute on first click anywhere
+      video.muted = true;
+      video.play().catch(() => {});
+      if (!tvAudioUnlocked) {
+        const unlock = () => {
+          tvAudioUnlocked = true;
+          const v = $('#round-video');
+          if (v) v.muted = false;
+          document.removeEventListener('click', unlock);
+          document.removeEventListener('keydown', unlock);
+        };
+        document.addEventListener('click', unlock, { once: true });
+        document.addEventListener('keydown', unlock, { once: true });
+      }
+    });
+  }
+}
+
 function applyVideoCommand(vs, force = false) {
   const video = $('#round-video');
   if (!video || !vs) return;
-  if (!force && vs.seq === lastVideoSeq) return;
+  const seqChanged = vs.seq !== lastVideoSeq;
+  if (!force && !seqChanged) {
+    // Still ensure playing state matches if video accidentally paused before stopAt
+    const stopAt = Number.isFinite(Number(vs.stopAt)) ? Number(vs.stopAt) : null;
+    if (vs.status === 'playing' && video.paused && (stopAt === null || video.currentTime < stopAt - 0.15)) {
+      tryPlayVideo(video);
+    }
+    return;
+  }
   lastVideoSeq = vs.seq;
 
-  const stopAt = Number.isFinite(Number(vs.stopAt)) ? Number(vs.stopAt) : null;
-  video.ontimeupdate = () => {
-    if (stopAt !== null && video.currentTime >= stopAt) {
+  const executeCmd = () => {
+    const stopAt = Number.isFinite(Number(vs.stopAt)) ? Number(vs.stopAt) : null;
+    video.ontimeupdate = () => {
+      if (stopAt !== null && video.currentTime >= stopAt) {
+        video.pause();
+        video.ontimeupdate = null;
+      }
+    };
+
+    if (Number.isFinite(Number(vs.position))) {
+      const targetPos = Number(vs.position);
+      if (Math.abs(video.currentTime - targetPos) > 0.4 || force || seqChanged) {
+        try {
+          video.currentTime = targetPos;
+        } catch {}
+      }
+    }
+
+    if (vs.status === 'playing') {
+      if (stopAt === null || video.currentTime < stopAt - 0.1) {
+        tryPlayVideo(video);
+      }
+    } else {
       video.pause();
-      video.ontimeupdate = null;
     }
   };
 
-  if (Number.isFinite(Number(vs.position))) {
-    const targetPos = Number(vs.position);
-    if (Math.abs(video.currentTime - targetPos) > 0.6 || force) {
-      try {
-        video.currentTime = targetPos;
-      } catch {}
-    }
-  }
-
-  if (vs.status === 'playing') {
-    if (stopAt === null || video.currentTime < stopAt - 0.1) {
-      video.play().catch(() => {});
-    }
+  if (video.readyState >= 1) {
+    executeCmd();
   } else {
-    video.pause();
+    video.addEventListener('loadedmetadata', executeCmd, { once: true });
+    if (vs.status === 'playing') tryPlayVideo(video);
   }
 }
 
 function syncRoundVideo() {
   const video = $('#round-video');
   if (!video || !state?.round?.videoUrl) return;
+  const desiredSrc = resolveVideoSrc(state.round.videoUrl);
+  if (desiredSrc && !desiredSrc.toLowerCase().startsWith('local:')) {
+    const currentAttr = video.getAttribute('src') || '';
+    if (currentAttr !== desiredSrc) {
+      video.setAttribute('src', desiredSrc);
+      video.load();
+      lastVideoSeq = -1;
+    }
+  }
   if (state.videoState) {
     applyVideoCommand(state.videoState, false);
   }
@@ -749,31 +848,51 @@ function roundBadgesHtml(s) {
   </div>`;
 }
 
-function screenContent() {
+function renderScreenDom() {
   const s = state;
+  app.className = 'screen';
   if (s.phase === 'lobby') {
-    return `<div class="tv-waiting-stage">
+    app.innerHTML = `<div class="tv-waiting-stage">
       <div class="tv-waiting-inner">
         <h1>${esc(s.title)}</h1>
         <p class="tv-pin">PIN: <strong>${esc(code)}</strong></p>
       </div>
     </div>`;
+    return;
   }
-  if (['watching', 'open', 'closed'].includes(s.phase)) {
-    return `<div class="tv-cinema-view">
-      ${videoStageHtml(s, true)}
-    </div>`;
+  if (['watching', 'open', 'closed', 'results'].includes(s.phase)) {
+    const src = resolveVideoSrc(s.round?.videoUrl || '');
+    const isMissingLocal = !src || src.toLowerCase().startsWith('local:');
+    let cinema = $('.tv-cinema-view');
+    const existingVideo = $('#round-video');
+
+    // Preserve existing <video> element if already playing the same source so we don't reset playback
+    if (!cinema || (isMissingLocal && existingVideo) || (!isMissingLocal && !existingVideo)) {
+      app.innerHTML = `<div class="tv-cinema-view">
+        ${videoStageHtml(s, true)}
+        <div id="tv-reveal-slot"></div>
+      </div>`;
+    } else if (existingVideo && !isMissingLocal) {
+      if (existingVideo.getAttribute('src') !== src) {
+        existingVideo.setAttribute('src', src);
+        existingVideo.load();
+        lastVideoSeq = -1;
+      }
+    }
+
+    const revealSlot = $('#tv-reveal-slot');
+    if (revealSlot) {
+      revealSlot.innerHTML =
+        s.phase === 'results' && s.round
+          ? `<section class="tv-answer-reveal">
+              <span class="tv-answer-label">✓ RESPUESTA CORRECTA</span>
+              <h2><strong>${letters[s.round.correct]}</strong> · ${esc(s.round.options[s.round.correct])}</h2>
+            </section>`
+          : '';
+    }
+    return;
   }
-  if (s.phase === 'results') {
-    return `<div class="tv-cinema-view">
-      ${videoStageHtml(s, true)}
-      <section class="tv-answer-reveal">
-        <span class="tv-answer-label">✓ RESPUESTA CORRECTA</span>
-        <h2><strong>${letters[s.round.correct]}</strong> · ${esc(s.round.options[s.round.correct])}</h2>
-      </section>
-    </div>`;
-  }
-  return ranking();
+  app.innerHTML = ranking();
 }
 
 function publicContent() {
@@ -1242,19 +1361,21 @@ function host() {
                   ${q.category ? ` · 🏷️ ${esc(q.category)}` : ''}
                   ${
                     q.videoUrl
-                      ? ` · 🎬 Video (${q.cutTime !== null ? 'corte ' + q.cutTime + 's' : 'sin corte automático'})`
-                      : ' · Sin video'
+                      ? ` · 🎬 Video: <strong>${esc(q.videoUrl)}</strong> (${
+                          q.cutTime !== null ? 'corte ' + q.cutTime + 's' : 'sin corte automático'
+                        })`
+                      : ' · ⚠️ Sin video asignado'
                   }
                 </div>
               </div>
               <div class="round-actions">
-                ${
-                  s.index !== i
-                    ? `<button type="button" class="primary-soft" data-jump="${i}" title="Ir directamente a esta película">▶ Lanzar película ${
-                        i + 1
-                      }</button>`
-                    : ''
-                }
+                <button type="button" class="primary-soft" data-jump="${i}" title="Lanzar y reproducir esta película en la TV ahora">
+                  ▶ ${s.index === i ? 'Relanzar película ' + (i + 1) : 'Lanzar película ' + (i + 1)}
+                </button>
+                <label class="tool-btn local-video-label" title="Elegir archivo de video local de este PC para esta película">
+                  📂 Elegir video local
+                  <input type="file" accept="video/*" data-row-video="${q.id}" hidden>
+                </label>
                 ${
                   s.phase === 'lobby'
                     ? `<button type="button" data-move="up" data-id="${q.id}" ${i === 0 ? 'disabled' : ''} title="Subir">↑</button>
@@ -1263,7 +1384,7 @@ function host() {
                       } title="Bajar">↓</button>`
                     : ''
                 }
-                <button type="button" data-edit="${q.id}">Editar / Video</button>
+                <button type="button" data-edit="${q.id}">Editar / Corte</button>
                 ${s.phase === 'lobby' ? `<button type="button" data-delete="${q.id}">Eliminar</button>` : ''}
               </div>
             </div>`
@@ -1307,6 +1428,7 @@ function host() {
     $('#action').onclick = async () => {
       sfx.click();
       await mutate({ op: 'action', action: action[0], expectedPhase: s.phase, expectedIndex: s.index, force: true });
+      if (state?.videoState) bc?.postMessage({ type: 'video-cmd', videoState: state.videoState });
       bc?.postMessage({ type: 'refresh' });
     };
   if ($('#btn-reveal-now'))
@@ -1332,6 +1454,7 @@ function host() {
         expectedIndex: s.index,
         force: true
       });
+      if (state?.videoState) bc?.postMessage({ type: 'video-cmd', videoState: state.videoState });
       bc?.postMessage({ type: 'refresh' });
     };
   document.querySelectorAll('[data-jump]').forEach(btn => {
@@ -1339,7 +1462,38 @@ function host() {
       sfx.click();
       const targetIndex = Number(btn.dataset.jump);
       await mutate({ op: 'action', action: 'prepare', targetIndex, expectedPhase: s.phase, expectedIndex: s.index, force: true });
+      if (state?.videoState) bc?.postMessage({ type: 'video-cmd', videoState: state.videoState });
       bc?.postMessage({ type: 'refresh' });
+    };
+  });
+  document.querySelectorAll('[data-row-video]').forEach(inp => {
+    inp.onchange = async e => {
+      const f = e.target.files?.[0];
+      if (!f) return;
+      const roundId = inp.dataset.rowVideo;
+      const targetRound = s.rounds.find(r => r.id === roundId);
+      if (!targetRound) return;
+      await saveLocalVideoToIdb(f);
+      try {
+        bc?.postMessage({ type: 'local-video-updated', name: f.name, file: f });
+      } catch {
+        bc?.postMessage({ type: 'local-video-updated', name: f.name });
+      }
+      await mutate({
+        op: 'edit-round',
+        id: targetRound.id,
+        question: targetRound.question,
+        options: targetRound.options,
+        correct: targetRound.correct,
+        seconds: targetRound.seconds,
+        practice: targetRound.practice,
+        category: targetRound.category || '',
+        videoUrl: 'local:' + f.name,
+        cutTime: targetRound.cutTime,
+        endTime: targetRound.endTime
+      });
+      bc?.postMessage({ type: 'refresh' });
+      notice(`✅ Video local "${f.name}" asignado a la película "${targetRound.question}".`);
     };
   });
   document.querySelectorAll('[data-mark-correct]').forEach(btn => {
@@ -1387,12 +1541,32 @@ function host() {
       const f = fileInput.files?.[0];
       if (!f) return;
       await saveLocalVideoToIdb(f);
-      bc?.postMessage({ type: 'local-video-updated' });
+      try {
+        bc?.postMessage({ type: 'local-video-updated', name: f.name, file: f });
+      } catch {
+        bc?.postMessage({ type: 'local-video-updated', name: f.name });
+      }
       const blobUrl = localTvVideos[f.name] || URL.createObjectURL(f);
       previewVideo.src = blobUrl;
       urlInput.value = 'local:' + f.name;
       const sizeMb = (f.size / (1024 * 1024)).toFixed(2);
-      statusEl.textContent = `✅ Video cargado en el Admin (${f.name} · ${sizeMb} MB) y listo para la Pantalla Gigante. Si deseas subirlo también a la nube (máx 3 MB), pulsa "☁️ Subir clip al servidor".`;
+      if (editingRound) {
+        await request({
+          op: 'edit-round',
+          id: editingRound.id,
+          question: $('#round').elements.question.value || editingRound.question,
+          options: letters.map((_, i) => $('#round').elements['option' + i].value || editingRound.options[i]),
+          correct: Number($('#round').elements.correct.value ?? editingRound.correct),
+          seconds: Number($('#round').elements.seconds.value || editingRound.seconds),
+          practice: $('#round').elements.practice.checked,
+          category: $('#round').elements.category.value,
+          videoUrl: 'local:' + f.name,
+          cutTime: $('#input-cut-time').value !== '' ? Number($('#input-cut-time').value) : null,
+          endTime: $('#input-end-time').value !== '' ? Number($('#input-end-time').value) : null
+        }).catch(() => {});
+        bc?.postMessage({ type: 'refresh' });
+      }
+      statusEl.textContent = `✅ Video cargado y vinculado automáticamente (${f.name} · ${sizeMb} MB). Ya está listo para reproducirse en la Pantalla Gigante.`;
     };
   }
   if ($('#admin-batch-local-files')) {
@@ -1400,8 +1574,12 @@ function host() {
       const files = Array.from(e.target.files || []);
       for (const f of files) {
         await saveLocalVideoToIdb(f);
+        try {
+          bc?.postMessage({ type: 'local-video-updated', name: f.name, file: f });
+        } catch {
+          bc?.postMessage({ type: 'local-video-updated', name: f.name });
+        }
       }
-      bc?.postMessage({ type: 'local-video-updated' });
       notice(`✅ Se guardaron ${files.length} video(s) locales desde el Admin listos para reproducirse en la TV.`);
     };
   }
@@ -1449,7 +1627,11 @@ function host() {
       const f = fileInput?.files?.[0];
       if (!f) return notice('Primero selecciona un archivo de video desde tu computador.');
       await saveLocalVideoToIdb(f);
-      bc?.postMessage({ type: 'local-video-updated' });
+      try {
+        bc?.postMessage({ type: 'local-video-updated', name: f.name, file: f });
+      } catch {
+        bc?.postMessage({ type: 'local-video-updated', name: f.name });
+      }
       urlInput.value = 'local:' + f.name;
       statusEl.textContent = `✅ Guardado en Admin (${f.name}). La Pantalla Gigante lo reproducirá automáticamente sin pedir archivos.`;
       notice('Video local guardado en Admin y sincronizado con la TV: ' + f.name);
@@ -1589,14 +1771,16 @@ function render() {
   if (role === 'host') host();
   else if (role === 'player') player();
   else {
-    app.className = 'screen';
-    app.innerHTML = header() + publicContent();
+    renderScreenDom();
   }
   syncRoundVideo();
   status();
 }
 
 async function refresh(force = false) {
+  if (role === 'screen') {
+    await loadLocalVideosFromIdb();
+  }
   const started = Date.now(),
     s = await request();
   offset = s.serverNow - (started + Date.now()) / 2;
@@ -1608,7 +1792,14 @@ async function refresh(force = false) {
     lastVideoSeq = -1;
   }
   handlePhaseEffects(s);
-  const key = JSON.stringify({ ...s, serverNow: 0, reactions: [], videoState: role === 'host' ? s.videoState : null });
+  const resolvedSrc = role === 'screen' && s.round?.videoUrl ? resolveVideoSrc(s.round.videoUrl) : '';
+  const key = JSON.stringify({
+    ...s,
+    serverNow: 0,
+    reactions: [],
+    resolvedSrc,
+    videoState: role === 'host' ? s.videoState : null
+  });
   const editing = role === 'host' && $('#editor')?.open;
   if ((key !== viewKey && !editing) || force) {
     viewKey = key;
