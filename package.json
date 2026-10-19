@@ -9,5 +9,8 @@
     "build": "node scripts/build.mjs",
     "test": "node --test test/cloud.test.mjs"
   },
-  "dependencies": { "qrcode": "^1.5.4" }
+  "dependencies": {
+    "@upstash/redis": "^1.34.0",
+    "qrcode": "^1.5.4"
+  }
 }
